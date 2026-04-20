@@ -151,3 +151,95 @@ class FidelityScheduler:
             f"(of {self.num_patches} patches)",
         ]
         return "\n".join(lines)
+
+
+class BudgetScheduler:
+    """
+    Budget-constrained fidelity scheduler for TDCF.
+
+    Instead of coverage thresholds (η_f, η_s) which drift toward full I/O
+    on datasets with uniform sensitivity distributions, this scheduler
+    directly controls the total band-slot budget as a fraction of full I/O.
+
+    The greedy allocator then distributes that budget optimally by
+    marginal utility:  Δ_utility(p, k) = g̃(p) × s(k)
+
+    Schedule:
+        B(e) = β + (1 − β) × (e / T)^γ
+
+    where β is the starting budget ratio and γ controls the ramp shape.
+    γ = 1.0 → linear ramp
+    γ > 1.0 → hold low longer, ramp late (curriculum: coarse→fine)
+    γ < 1.0 → ramp early, plateau high
+    """
+
+    def __init__(self, num_bands: int, num_patches: int,
+                 beta: float = 0.5, gamma: float = 1.0,
+                 k_low: int = 1):
+        """
+        Args:
+            num_bands:   Total number of frequency bands B.
+            num_patches: Total number of spatial patches P.
+            beta:        Starting budget ratio (0 < β < 1).
+                         β = 0.5 means start at 50% I/O.
+            gamma:       Ramp exponent.  γ=1 is linear, γ=2 is "hold then ramp".
+            k_low:       Minimum bands per patch (0 = skip background entirely).
+        """
+        self.num_bands = num_bands
+        self.num_patches = num_patches
+        self.beta = beta
+        self.gamma = gamma
+        self.k_low = k_low
+        self._total_epochs = None
+        self._pilot_epochs = 0
+
+        # Full budget = P × B band-slots
+        self.full_budget = num_patches * num_bands
+        # Minimum budget = P × k_low
+        self.min_budget = num_patches * k_low
+
+    def fit_from_pilot(self, sensitivity_estimator, total_epochs: int):
+        """
+        Store pilot statistics.  The BudgetScheduler doesn't need isotonic
+        regression — it uses a parametric curve.  But we still read the
+        pilot to expose band/patch sensitivity to the greedy allocator.
+        """
+        self._pilot_epochs = len(sensitivity_estimator.band_sensitivity_history)
+        self._total_epochs = total_epochs
+
+    def get_budget(self, epoch: int) -> int:
+        """
+        Total band-slot budget for this epoch.
+
+        B(e) = B_min + (B_full - B_min) × ratio(e)
+        ratio(e) = β + (1 − β) × (e / T)^γ
+
+        Returns:
+            Integer number of total band-slots (max = P × num_bands).
+        """
+        T = max(self._total_epochs - 1, 1)
+        t = min(epoch, T)
+        ratio = self.beta + (1.0 - self.beta) * (t / T) ** self.gamma
+        budget = int(round(self.full_budget * ratio))
+        return max(self.min_budget, min(budget, self.full_budget))
+
+    def get_io_ratio(self, epoch: int) -> float:
+        """Fraction of full I/O used at this epoch."""
+        return self.get_budget(epoch) / self.full_budget
+
+    def summary(self) -> str:
+        if self._total_epochs is None:
+            return "BudgetScheduler not fitted."
+        b_start = self.get_budget(0)
+        b_end = self.get_budget(self._total_epochs - 1)
+        avg_io = np.mean([self.get_io_ratio(e) for e in range(self._total_epochs)])
+        lines = [
+            f"TDCF Budget Schedule ({self._total_epochs} epochs, "
+            f"fitted from {self._pilot_epochs} pilot epochs)",
+            f"  β = {self.beta:.2f}, γ = {self.gamma:.1f}, k_low = {self.k_low}",
+            f"  Budget: {b_start} → {b_end} band-slots "
+            f"(of {self.full_budget} full)",
+            f"  I/O ratio: {self.get_io_ratio(0):.1%} → {self.get_io_ratio(self._total_epochs - 1):.1%}",
+            f"  Average I/O: {avg_io:.1%}",
+        ]
+        return "\n".join(lines)

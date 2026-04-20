@@ -17,7 +17,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 
 # Re-use our components
 from tdcf.sensitivity import BlockSensitivityEstimator
-from tdcf.scheduler import FidelityScheduler
+from tdcf.scheduler import FidelityScheduler, BudgetScheduler
 from tdcf.io_dataloader import BlockBandStore
 from tdcf.transforms import block_idct2d
 
@@ -225,7 +225,12 @@ def train_tpu_process(index, args):
     # ── 3. TDCF Components ──
     nph = npw = IMAGE_SIZE // BLOCK_SIZE
     estimator = BlockSensitivityEstimator(BLOCK_SIZE, nph, npw, NUM_BANDS, device=device)
-    fsched = FidelityScheduler(NUM_BANDS, P, args.eta_f, args.eta_s)
+
+    if args.budget_mode:
+        fsched = BudgetScheduler(NUM_BANDS, P, beta=args.beta,
+                                 gamma=args.gamma, k_low=args.k_low)
+    else:
+        fsched = FidelityScheduler(NUM_BANDS, P, args.eta_f, args.eta_s)
 
     # --- PILOT PHASE ---
     # NOTE: We do NOT call estimator.measure_sensitivity() on TPU because
@@ -296,18 +301,26 @@ def train_tpu_process(index, args):
     for ep in range(args.total_epochs):
         train_sampler.set_epoch(ep)
 
-        K_high, q_e = fsched.get_fidelity(ep)
         ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
         bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
         ps = estimator.patch_sensitivity_history[ps_idx]
         bs = estimator.band_sensitivity_history[bs_idx]
 
-        train_store.set_fidelity(
-            K_high, args.k_low, q_e,
-            patch_sensitivity=ps,
-            band_sensitivity=bs,
-            patch_policy=args.patch_policy,
-        )
+        if args.budget_mode:
+            budget = fsched.get_budget(ep)
+            train_store.set_budget(
+                budget, patch_sensitivity=ps,
+                band_sensitivity=bs, k_low=args.k_low,
+            )
+            io_target = fsched.get_io_ratio(ep)
+        else:
+            K_high, q_e = fsched.get_fidelity(ep)
+            train_store.set_fidelity(
+                K_high, args.k_low, q_e,
+                patch_sensitivity=ps,
+                band_sensitivity=bs,
+                patch_policy=args.patch_policy,
+            )
 
         model.train()
         loss_s, correct, n = make_epoch_accumulators(device)
@@ -359,14 +372,25 @@ def train_tpu_process(index, args):
 
         if is_master:
             io_ratio = train_store.get_io_ratio()
-            print(
-                f"  E {ep+1:3d}/{args.total_epochs} | "
-                f"K_hi={K_high:2d} K_lo={args.k_low} q={q_e:2d} | "
-                f"IO={io_ratio:.3f} | "
-                f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
-                f"Te Loss={te_loss_avg:.4f} Te Acc={te_acc:.4f} | "
-                f"LR={opt.param_groups[0]['lr']:.4f}"
-            )
+            if args.budget_mode:
+                budget = fsched.get_budget(ep)
+                print(
+                    f"  E {ep+1:3d}/{args.total_epochs} | "
+                    f"Budget={budget:4d}/{P*NUM_BANDS} | "
+                    f"IO={io_ratio:.3f} | "
+                    f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
+                    f"Te Loss={te_loss_avg:.4f} Te Acc={te_acc:.4f} | "
+                    f"LR={opt.param_groups[0]['lr']:.4f}"
+                )
+            else:
+                print(
+                    f"  E {ep+1:3d}/{args.total_epochs} | "
+                    f"K_hi={K_high:2d} K_lo={args.k_low} q={q_e:2d} | "
+                    f"IO={io_ratio:.3f} | "
+                    f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
+                    f"Te Loss={te_loss_avg:.4f} Te Acc={te_acc:.4f} | "
+                    f"LR={opt.param_groups[0]['lr']:.4f}"
+                )
 
     if is_master:
         print("Training complete! Run model save logic here.")
@@ -402,6 +426,12 @@ if __name__ == "__main__":
     parser.add_argument("--eta_s", type=float, default=0.85)
     parser.add_argument("--patch_policy", choices=["gradient", "random", "static", "greedy"],
                         default="greedy")
+    parser.add_argument("--budget_mode", action="store_true",
+                        help="Use budget-constrained scheduler instead of coverage thresholds.")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="Starting budget ratio (0 < β < 1). Only used with --budget_mode.")
+    parser.add_argument("--gamma", type=float, default=1.5,
+                        help="Ramp exponent. γ=1 linear, γ>1 hold-then-ramp. Only with --budget_mode.")
     parser.add_argument("--data_workers", type=int, default=0,
                         help="Ignored on TPU; worker count is forced to 0 for stability.")
     args = parser.parse_args()

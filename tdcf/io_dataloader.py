@@ -537,6 +537,43 @@ class BlockBandStore:
         else:
             self.band_sensitivity = np.ones(self.num_bands, dtype=np.float32) / self.num_bands
 
+    def set_budget(self, total_bands: int,
+                   patch_sensitivity: np.ndarray = None,
+                   band_sensitivity: np.ndarray = None,
+                   k_low: int = 1):
+        """
+        Budget-constrained fidelity allocation.
+
+        Instead of coverage thresholds (K_high, q) that drift toward
+        full I/O on datasets with flat sensitivity, this method directly
+        controls the total number of band-slots read across all patches.
+
+        The greedy allocator distributes this budget to maximize:
+            Σ_p Σ_{b ∈ allocated(p)} g̃(p) × s(b)
+
+        Args:
+            total_bands: Total band-slot budget (max = P × num_bands).
+            patch_sensitivity: (P,) per-patch importance weights.
+            band_sensitivity:  (num_bands,) per-band importance weights.
+            k_low:  Minimum bands per patch (floor guarantee).
+        """
+        self.budget_bands = max(self.P * k_low,
+                                min(total_bands, self.P * self.num_bands))
+        self.K_low = k_low
+        self.K_high = self.num_bands  # greedy will decide actual K per patch
+        self.q = self.P              # greedy handles all patches
+        self.patch_policy = 'greedy'
+
+        self.n_coeffs_high = self.K_high * self.band_size
+        self.n_coeffs_low = self.K_low * self.band_size
+
+        if patch_sensitivity is not None:
+            self.patch_sensitivity = np.asarray(
+                patch_sensitivity, dtype=np.float32).copy()
+        if band_sensitivity is not None:
+            self.band_sensitivity = np.asarray(
+                band_sensitivity, dtype=np.float32).copy()
+
     # ── Patch selection policies ────────────────────────────────────────
 
     def _compute_importance_mask(self, indices: np.ndarray) -> np.ndarray:
