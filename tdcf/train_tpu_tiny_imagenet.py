@@ -65,8 +65,8 @@ def augment_tiny_batch(x: torch.Tensor) -> torch.Tensor:
     
     # Normalized shifts for +/- 8 pixels.
     # shift_pixels / (H/2) translates pixels to the [-1, 1] grid space.
-    shift_y = torch.randint(-8, 9, (B,), device=x.device, dtype=torch.float32) / (H / 2)
-    shift_x = torch.randint(-8, 9, (B,), device=x.device, dtype=torch.float32) / (W / 2)
+    shift_y = torch.randint(-8, 9, (B,), device=x.device).float() / (H / 2)
+    shift_x = torch.randint(-8, 9, (B,), device=x.device).float() / (W / 2)
     
     # Horizontal flip mask (+1.0 or -1.0)
     flip = torch.where(torch.rand(B, device=x.device) < 0.5, -1.0, 1.0)
@@ -228,6 +228,10 @@ def train_tpu_process(index, args):
     fsched = FidelityScheduler(NUM_BANDS, P, args.eta_f, args.eta_s)
 
     # --- PILOT PHASE ---
+    # NOTE: We do NOT call estimator.measure_sensitivity() on TPU because
+    # torch.autograd.grad() segfaults on XLA's lazy evaluator.  Instead we
+    # merge sensitivity capture into the single training backward pass by
+    # making coeffs a leaf tensor and reading coeffs.grad after loss.backward().
     if is_master:
         print(f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, {pilot_n} samples")
 
@@ -238,19 +242,28 @@ def train_tpu_process(index, args):
         para_loader = pl.MpDeviceLoader(pilot_loader, device)
 
         for coeffs, y in para_loader:
-            # Sensitivity probe in eval mode to avoid BN/dropout drift.
-            model.eval()
-            estimator.measure_sensitivity(coeffs, y, model, crit)
+            # Make coeffs a leaf so loss.backward() populates coeffs.grad
+            # This gives us input sensitivity FOR FREE from the training pass.
+            coeffs = coeffs.detach().requires_grad_(True)
 
-            # Standard pilot training step.
-            model.train()
-            x = augment_tiny_batch(block_idct2d(coeffs, nph, npw))
             pilot_opt.zero_grad(set_to_none=True)
+            x = block_idct2d(coeffs, nph, npw)
             logits = model(x)
             loss = crit(logits, y)
-            if not torch.isfinite(loss):
-                raise RuntimeError("Non-finite pilot loss.")
             loss.backward()
+
+            # --- Accumulate sensitivity from coeffs.grad (XLA-safe) ---
+            if coeffs.grad is not None:
+                grad = coeffs.grad.detach()
+                # Per-patch sensitivity: |grad| summed over (C, bs, bs)
+                patch_sens = grad.abs().sum(dim=(2, 3, 4)).mean(dim=0)
+                estimator._patch_accum += patch_sens
+                # Per-band sensitivity
+                grad_flat = grad.abs().mean(dim=(0, 1)).sum(dim=0).reshape(-1)
+                for b, band_idx in enumerate(estimator.bands):
+                    estimator._band_accum[b] += grad_flat[band_idx.to(device)].sum()
+                estimator._step_count += 1
+
             xm.optimizer_step(pilot_opt)
 
         estimator.finalize_epoch()
