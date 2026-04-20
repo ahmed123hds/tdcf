@@ -174,20 +174,21 @@ class BudgetScheduler:
     """
 
     def __init__(self, num_bands: int, num_patches: int,
-                 beta: float = 0.5, gamma: float = 1.0,
+                 beta: float = 0.5, max_beta: float = 1.0, gamma: float = 1.0,
                  k_low: int = 1):
         """
         Args:
             num_bands:   Total number of frequency bands B.
             num_patches: Total number of spatial patches P.
             beta:        Starting budget ratio (0 < β < 1).
-                         β = 0.5 means start at 50% I/O.
+            max_beta:    Ending budget ratio (default 1.0).
             gamma:       Ramp exponent.  γ=1 is linear, γ=2 is "hold then ramp".
             k_low:       Minimum bands per patch (0 = skip background entirely).
         """
         self.num_bands = num_bands
         self.num_patches = num_patches
         self.beta = beta
+        self.max_beta = max_beta
         self.gamma = gamma
         self.k_low = k_low
         self._total_epochs = None
@@ -219,7 +220,7 @@ class BudgetScheduler:
         """
         T = max(self._total_epochs - 1, 1)
         t = min(epoch, T)
-        ratio = self.beta + (1.0 - self.beta) * (t / T) ** self.gamma
+        ratio = self.beta + (self.max_beta - self.beta) * (t / T) ** self.gamma
         budget = int(round(self.full_budget * ratio))
         return max(self.min_budget, min(budget, self.full_budget))
 
@@ -236,7 +237,7 @@ class BudgetScheduler:
         lines = [
             f"TDCF Budget Schedule ({self._total_epochs} epochs, "
             f"fitted from {self._pilot_epochs} pilot epochs)",
-            f"  β = {self.beta:.2f}, γ = {self.gamma:.1f}, k_low = {self.k_low}",
+            f"  β_start = {self.beta:.2f}, β_end = {self.max_beta:.2f}, γ = {self.gamma:.1f}, k_low = {self.k_low}",
             f"  Budget: {b_start} → {b_end} band-slots "
             f"(of {self.full_budget} full)",
             f"  I/O ratio: {self.get_io_ratio(0):.1%} → {self.get_io_ratio(self._total_epochs - 1):.1%}",

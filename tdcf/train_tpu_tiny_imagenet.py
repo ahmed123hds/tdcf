@@ -227,7 +227,7 @@ def train_tpu_process(index, args):
     estimator = BlockSensitivityEstimator(BLOCK_SIZE, nph, npw, NUM_BANDS, device=device)
 
     if args.budget_mode:
-        fsched = BudgetScheduler(NUM_BANDS, P, beta=args.beta,
+        fsched = BudgetScheduler(NUM_BANDS, P, beta=args.beta, max_beta=args.max_beta,
                                  gamma=args.gamma, k_low=args.k_low)
     else:
         fsched = FidelityScheduler(NUM_BANDS, P, args.eta_f, args.eta_s)
@@ -430,6 +430,8 @@ if __name__ == "__main__":
                         help="Use budget-constrained scheduler instead of coverage thresholds.")
     parser.add_argument("--beta", type=float, default=0.5,
                         help="Starting budget ratio (0 < β < 1). Only used with --budget_mode.")
+    parser.add_argument("--max_beta", type=float, default=1.0,
+                        help="Ending budget ratio. Capping this below 1.0 enforces permanent I/O savings.")
     parser.add_argument("--gamma", type=float, default=1.5,
                         help="Ramp exponent. γ=1 linear, γ>1 hold-then-ramp. Only with --budget_mode.")
     parser.add_argument("--data_workers", type=int, default=0,
