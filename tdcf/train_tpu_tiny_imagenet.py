@@ -255,4 +255,4 @@ if __name__ == '__main__':
     os.makedirs(args.save_dir, exist_ok=True)
     
     # Spawn 8 processes for TPU v4-8
-    xmp.spawn(train_tpu_process, args=(args,), nprocs=8, start_method='fork')
+    xmp.spawn(train_tpu_process, args=(args,), nprocs=8, start_method='spawn')
