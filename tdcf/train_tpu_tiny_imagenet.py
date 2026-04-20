@@ -155,7 +155,11 @@ def train_tpu_process(index, args):
 
         estimator.finalize_epoch()
         if is_master:
-            print(f"  Pilot {ep+1}/{args.pilot_epochs} completed.")
+            K = estimator.compute_band_cutoff(ep, args.eta_f)
+            q = estimator.compute_patch_quota(ep, args.eta_s)
+            bs = estimator.band_sensitivity_history[ep]
+            print(f"  Pilot {ep+1:2d}/{args.pilot_epochs} | K_high={K:2d}/{NUM_BANDS} | q={q:2d}/{P} | "
+                  f"band_low={bs[0]:.4f} band_high={bs[-1]:.4f}")
 
     # Fit the schedule from pilot statistics
     fsched.fit_from_pilot(estimator, args.total_epochs)
