@@ -19,6 +19,7 @@ from tdcf.sensitivity import BlockSensitivityEstimator
 from tdcf.scheduler import FidelityScheduler
 from tdcf.io_dataloader import BlockBandStore
 from tdcf.transforms import block_idct2d
+from tdcf.models import CIFAR100ResNet18
 
 # Tiny ImageNet constants
 NUM_CLASSES = 200
@@ -26,27 +27,6 @@ IMAGE_SIZE = 64
 BLOCK_SIZE = 8
 P = (IMAGE_SIZE // BLOCK_SIZE) ** 2  # 8x8 = 64 patches
 NUM_BANDS = 16
-
-# Dummy backbone for Tiny ImageNet (can be swapped for ResNet later)
-class TinyImageNetCNN(nn.Module):
-    def __init__(self, num_classes=200):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2), # 32x32
-            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2), # 16x16
-            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2), # 8x8
-            nn.Conv2d(256, 512, kernel_size=3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        self.classifier = nn.Linear(512, num_classes)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = torch.flatten(x, 1)
-        return self.classifier(x)
 
 
 # --- Dataloader Wrapper for BlockBandStore ---
@@ -115,7 +95,7 @@ def train_tpu_process(index, args):
     )
 
     # ── 2. Model & Optimizer ──
-    model = TinyImageNetCNN(num_classes=NUM_CLASSES).to(device)
+    model = CIFAR100ResNet18(num_classes=NUM_CLASSES).to(device)
     
     # Scale LR by world size (standard practice for DDP/XLA)
     scaled_lr = args.lr * xm.xrt_world_size()
