@@ -18,6 +18,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from tdcf.sensitivity import BlockSensitivityEstimator
 from tdcf.scheduler import FidelityScheduler
 from tdcf.io_dataloader import BlockBandStore
+from tdcf.transforms import block_idct2d
 
 # Tiny ImageNet constants
 NUM_CLASSES = 200
@@ -140,7 +141,8 @@ def train_tpu_process(index, args):
 
         for coeffs, y in para_loader:
             coeffs = coeffs.detach().requires_grad_(True)
-            logits = model(coeffs)
+            x = block_idct2d(coeffs, nph, npw)
+            logits = model(x)
             loss = crit(logits, y)
             loss.backward()
             xm.optimizer_step(opt)
@@ -181,7 +183,8 @@ def train_tpu_process(index, args):
         para_train = pl.MpDeviceLoader(train_loader, device)
         for coeffs, y in para_train:
             opt.zero_grad()
-            logits = model(coeffs)
+            x = block_idct2d(coeffs, nph, npw)
+            logits = model(x)
             loss = crit(logits, y)
             loss.backward()
             xm.optimizer_step(opt)
@@ -211,7 +214,8 @@ def train_tpu_process(index, args):
         para_test = pl.MpDeviceLoader(test_loader, device)
         with torch.no_grad():
             for coeffs, y in para_test:
-                logits = model(coeffs)
+                x = block_idct2d(coeffs, nph, npw)
+                logits = model(x)
                 loss = crit(logits, y)
                 te_loss_s += loss.item() * y.size(0)
                 te_correct += (logits.argmax(1) == y).sum().item()
