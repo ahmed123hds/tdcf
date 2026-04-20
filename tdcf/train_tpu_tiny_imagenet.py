@@ -57,31 +57,31 @@ def make_tiny_imagenet_model(device: torch.device) -> nn.Module:
 
 
 def augment_tiny_batch(x: torch.Tensor) -> torch.Tensor:
-    """GPU/XLA-friendly Tiny-ImageNet augmentation on raw [0,1] tensors."""
-    B, _, H_img, W_img = x.shape
-    x = x.clamp_(0.0, 1.0)
-
-    # Random crop with 8-pixel padding.
-    x_pad = torch.nn.functional.pad(x, (8, 8, 8, 8))
-    top = torch.randint(0, 17, (B,), device=x.device)
-    left = torch.randint(0, 17, (B,), device=x.device)
-    row_base = torch.arange(H_img, device=x.device)
-    col_base = torch.arange(W_img, device=x.device)
-
-    # Gather rows/cols directly instead of materializing the full unfold grid.
-    row_idx = (top[:, None] + row_base[None, :])[:, None, :, None]
-    row_idx = row_idx.expand(B, x_pad.size(1), H_img, x_pad.size(3))
-    x = x_pad.gather(2, row_idx)
-
-    col_idx = (left[:, None] + col_base[None, :])[:, None, None, :]
-    col_idx = col_idx.expand(B, x.size(1), H_img, W_img)
-    x = x.gather(3, col_idx)
-
-    # Random horizontal flip.
-    flip_mask = torch.rand(B, device=x.device) < 0.5
-    if flip_mask.any():
-        x[flip_mask] = torch.flip(x[flip_mask], dims=[3])
-
+    """
+    Apply Tiny ImageNet training augmentation to a normalized tensor batch.
+    Uses grid_sample for highly efficient TPU execution without memory explosion.
+    """
+    B, _, H, W = x.shape
+    
+    # Normalized shifts for +/- 8 pixels.
+    # shift_pixels / (H/2) translates pixels to the [-1, 1] grid space.
+    shift_y = torch.randint(-8, 9, (B,), device=x.device, dtype=torch.float32) / (H / 2)
+    shift_x = torch.randint(-8, 9, (B,), device=x.device, dtype=torch.float32) / (W / 2)
+    
+    # Horizontal flip mask (+1.0 or -1.0)
+    flip = torch.where(torch.rand(B, device=x.device) < 0.5, -1.0, 1.0)
+    
+    # Construct affine transformation matrices
+    theta = torch.zeros(B, 2, 3, device=x.device)
+    theta[:, 0, 0] = flip       # Scale X (flip)
+    theta[:, 1, 1] = 1.0        # Scale Y
+    theta[:, 0, 2] = shift_x    # Translate X
+    theta[:, 1, 2] = shift_y    # Translate Y
+    
+    # Generate grid and sample
+    grid = torch.nn.functional.affine_grid(theta, x.size(), align_corners=False)
+    x = torch.nn.functional.grid_sample(x, grid, padding_mode='zeros', align_corners=False)
+    
     # Lightweight color jitter in tensor space.
     brightness = 1.0 + torch.empty(B, 1, 1, 1, device=x.device).uniform_(-0.2, 0.2)
     contrast = 1.0 + torch.empty(B, 1, 1, 1, device=x.device).uniform_(-0.2, 0.2)
