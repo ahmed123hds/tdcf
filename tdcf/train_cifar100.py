@@ -67,6 +67,8 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--pilot_lr",     type=float, default=None,
                    help="Optional learning rate used only during the pilot phase.")
+    p.add_argument("--warmup_epochs", type=int, default=5,
+                   help="Warmup epochs for ViT learning-rate scheduling.")
     p.add_argument("--wd",           type=float, default=5e-4)
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--data_workers", type=int,   default=0)
@@ -166,6 +168,44 @@ def augment_cifar_batch(x: torch.Tensor) -> torch.Tensor:
     x = (x - x_gray) * saturation + x_gray
 
     return normalize_batch(x.clamp_(0.0, 1.0))
+
+
+def make_optimizer(args, model, lr: float):
+    """Use a transformer-friendly optimizer for ViT while keeping the CNN recipe intact."""
+    if args.backbone == "vit":
+        return optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=args.wd,
+            betas=(0.9, 0.999),
+        )
+    return optim.SGD(
+        model.parameters(),
+        lr=lr,
+        momentum=0.9,
+        weight_decay=args.wd,
+        nesterov=True,
+    )
+
+
+def make_scheduler(args, optimizer, total_epochs: int):
+    """ViT uses warmup + cosine; CNN keeps the original cosine schedule."""
+    if args.backbone != "vit":
+        return optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs)
+
+    warmup_epochs = max(0, min(args.warmup_epochs, max(total_epochs - 1, 0)))
+    if warmup_epochs == 0:
+        return optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs)
+
+    warmup = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+    )
+    cosine = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, total_epochs - warmup_epochs)
+    )
+    return optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+    )
 
 
 # ── helpers ───────────────────────────────────────────────────────────
@@ -409,8 +449,7 @@ def run_tdcf(args, log):
 
     crit = nn.CrossEntropyLoss(label_smoothing=0.1)
     pilot_lr = args.pilot_lr if args.pilot_lr is not None else args.lr
-    pilot_opt = optim.SGD(model.parameters(), lr=pilot_lr, momentum=0.9,
-                          weight_decay=args.wd, nesterov=True)
+    pilot_opt = make_optimizer(args, model, pilot_lr)
     log.info("Pilot LR: %.3e  |  Main LR: %.3e", pilot_lr, args.lr)
 
     # ── masks & estimator ──
@@ -443,9 +482,8 @@ def run_tdcf(args, log):
 
     # Fresh optimizer for the full training run so pilot momentum/state does
     # not bleed into the main experiment.
-    opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
-                    weight_decay=args.wd, nesterov=True)
-    sched_lr = optim.lr_scheduler.CosineAnnealingLR(opt, args.total_epochs)
+    opt = make_optimizer(args, model, args.lr)
+    sched_lr = make_scheduler(args, opt, args.total_epochs)
 
     # ── adaptive training ──
     proxy_server = TDCFServer(H, W, NUM_BANDS, PATCH_SIZE, device)
@@ -577,9 +615,8 @@ def run_baseline(args, log):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     model    = make_model(args.backbone, "cifar100", device)
-    opt      = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
-                         weight_decay=args.wd, nesterov=True)
-    sched_lr = optim.lr_scheduler.CosineAnnealingLR(opt, args.total_epochs)
+    opt      = make_optimizer(args, model, args.lr)
+    sched_lr = make_scheduler(args, opt, args.total_epochs)
     crit     = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     if args.use_band_store:
@@ -770,8 +807,7 @@ def run_tdcf_block(args, log):
 
     crit = nn.CrossEntropyLoss(label_smoothing=0.1)
     pilot_lr = args.pilot_lr if args.pilot_lr is not None else args.lr
-    pilot_opt = optim.SGD(model.parameters(), lr=pilot_lr, momentum=0.9,
-                          weight_decay=args.wd, nesterov=True)
+    pilot_opt = make_optimizer(args, model, pilot_lr)
 
     # ── pilot ──
     estimator = BlockSensitivityEstimator(
@@ -849,9 +885,8 @@ def run_tdcf_block(args, log):
         batch_size=512, shuffle=False, num_workers=0)
 
     # Fresh optimizer
-    opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
-                    weight_decay=args.wd, nesterov=True)
-    sched_lr = optim.lr_scheduler.CosineAnnealingLR(opt, args.total_epochs)
+    opt = make_optimizer(args, model, args.lr)
+    sched_lr = make_scheduler(args, opt, args.total_epochs)
 
     # ── adaptive training ──
     log.info("=" * 60)
