@@ -729,9 +729,12 @@ class BlockBandStore:
         With sample-adaptive q, each sample reads exactly q patches at
         K_high and (P-q) patches at K_low, regardless of *which* patches.
         """
-        coeffs_read = (self.q * self.K_high +
-                       (self.P - self.q) * self.K_low) * self.band_size
         coeffs_full = self.P * self.total_coeffs
+        if self.patch_policy == 'greedy':
+            coeffs_read = self.budget_bands * self.band_size
+        else:
+            coeffs_read = (self.q * self.K_high +
+                           (self.P - self.q) * self.K_low) * self.band_size
         return coeffs_read / coeffs_full
 
     def get_epoch_io_ratio(self) -> float:
