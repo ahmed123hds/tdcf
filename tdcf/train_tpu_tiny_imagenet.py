@@ -104,12 +104,12 @@ def train_tpu_process(index, args):
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
-        sampler=train_sampler, num_workers=args.data_workers,
+        sampler=train_sampler, num_workers=0,
         collate_fn=lambda b: collate_block_store(b, train_store), drop_last=True
     )
     test_loader = DataLoader(
         test_dataset, batch_size=args.batch_size,
-        sampler=test_sampler, num_workers=args.data_workers,
+        sampler=test_sampler, num_workers=0,
         collate_fn=lambda b: collate_block_store(b, test_store), drop_last=False
     )
 
