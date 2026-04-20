@@ -15,7 +15,7 @@ import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 
 # Re-use our components
-from tdcf.sensitivity import SensitivityEstimator
+from tdcf.sensitivity import BlockSensitivityEstimator
 from tdcf.scheduler import FidelityScheduler
 from tdcf.io_dataloader import BlockBandStore
 
@@ -124,7 +124,8 @@ def train_tpu_process(index, args):
     sched_lr = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.total_epochs)
 
     # ── 3. TDCF Components ──
-    estimator = SensitivityEstimator(P, NUM_BANDS)
+    nph = npw = IMAGE_SIZE // BLOCK_SIZE
+    estimator = BlockSensitivityEstimator(BLOCK_SIZE, nph, npw, NUM_BANDS, device=device)
     fsched = FidelityScheduler(NUM_BANDS, P, args.eta_f, args.eta_s)
 
     # --- PILOT PHASE ---
