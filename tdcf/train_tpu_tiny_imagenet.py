@@ -1,6 +1,5 @@
 import os
 import argparse
-import functools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -137,7 +136,7 @@ def build_loader(dataset, store, batch_size, sampler, num_workers, drop_last):
         num_workers=num_workers,
         drop_last=drop_last,
         collate_fn=collator,
-        persistent_workers=num_workers > 0,
+        persistent_workers=False,
     )
 
 
@@ -157,6 +156,7 @@ def train_tpu_process(index, args):
     world_size = xm.xrt_world_size()
     rank = xm.get_ordinal()
     is_master = xm.is_master_ordinal()
+    worker_count = 0
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -164,6 +164,7 @@ def train_tpu_process(index, args):
     if is_master:
         print("=" * 60)
         print("  TDCF — TPU v4-8  |  Tiny ImageNet (64x64)")
+        print(f"  Data workers forced to {worker_count} for TPU stability")
         print("=" * 60)
 
     # ── 1. Setup BlockBandStore ──
@@ -189,15 +190,15 @@ def train_tpu_process(index, args):
 
     train_loader = build_loader(
         train_dataset, train_store, args.batch_size, train_sampler,
-        args.data_workers, drop_last=True
+        worker_count, drop_last=True
     )
     pilot_loader = build_loader(
         pilot_dataset, train_store, args.batch_size, pilot_sampler,
-        args.data_workers, drop_last=True
+        worker_count, drop_last=True
     )
     test_loader = build_loader(
         test_dataset, test_store, args.eval_batch_size, test_sampler,
-        args.data_workers, drop_last=False
+        worker_count, drop_last=False
     )
 
     # ── 2. Model & Optimizer ──
@@ -371,7 +372,8 @@ if __name__ == "__main__":
     parser.add_argument("--eta_s", type=float, default=0.85)
     parser.add_argument("--patch_policy", choices=["gradient", "random", "static", "greedy"],
                         default="greedy")
-    parser.add_argument("--data_workers", type=int, default=4)
+    parser.add_argument("--data_workers", type=int, default=0,
+                        help="Ignored on TPU; worker count is forced to 0 for stability.")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
