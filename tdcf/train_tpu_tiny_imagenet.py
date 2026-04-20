@@ -140,16 +140,18 @@ def train_tpu_process(index, args):
         para_loader = pl.MpDeviceLoader(train_loader, device)
 
         for coeffs, y in para_loader:
-            coeffs = coeffs.detach().requires_grad_(True)
+            # 1. Measure sensitivity (in eval mode to protect BatchNorm)
+            model.eval()
+            estimator.measure_sensitivity(coeffs, y, model, crit)
+
+            # 2. Standard pilot training step
+            model.train()
+            opt.zero_grad()
             x = block_idct2d(coeffs, nph, npw)
             logits = model(x)
             loss = crit(logits, y)
             loss.backward()
             xm.optimizer_step(opt)
-            opt.zero_grad()
-
-            if coeffs.grad is not None:
-                estimator.update(coeffs.grad.cpu())
 
         estimator.finalize_epoch()
         if is_master:
