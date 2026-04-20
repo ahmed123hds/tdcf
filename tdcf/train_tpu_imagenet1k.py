@@ -17,7 +17,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 
 from tdcf.sensitivity import BlockSensitivityEstimator
 from tdcf.scheduler import FidelityScheduler, BudgetScheduler
-from tdcf.transforms import block_dct2d, block_idct2d, zigzag_order
+from tdcf.transforms import block_dct2d, block_idct2d
 
 
 os.environ.setdefault("PJRT_DEVICE", "TPU")
@@ -208,42 +208,54 @@ def compute_k_allocation(
     q: int = None,
 ):
     """
-    Compute per-sample, per-patch frequency budgets directly on TPU.
+    XLA-safe per-sample, per-patch frequency budget computation.
 
-    coeffs: (B, P, C, bs, bs)
-    Returns:
-        k_alloc: (B, P) int64
+    Returns k_alloc (B, P) int64 on the same device as coeffs.
+    Uses only static shapes and no dynamic scatter/index_select.
     """
     B, P, _, bs_h, bs_w = coeffs.shape
     device = coeffs.device
-    patch_signal = coeffs.abs().mean(dim=(2, 3, 4))  # (B, P)
-    patch_weights = torch.as_tensor(patch_sensitivity, device=device, dtype=patch_signal.dtype)
-    band_weights = torch.as_tensor(band_sensitivity, device=device, dtype=patch_signal.dtype)
+
+    patch_signal = coeffs.detach().abs().mean(dim=(2, 3, 4))  # (B, P)
+    patch_weights = torch.as_tensor(
+        patch_sensitivity, device=device, dtype=patch_signal.dtype
+    )
+    band_weights = torch.as_tensor(
+        band_sensitivity, device=device, dtype=patch_signal.dtype
+    )
+    utility = patch_signal * patch_weights.unsqueeze(0)  # (B, P)
 
     if budget_bands is not None:
-        k_alloc = torch.full((B, P), int(k_low), dtype=torch.long, device=device)
-        extra = int(budget_bands) - P * int(k_low)
-        if extra <= 0:
-            return k_alloc
+        # Greedy budget: start everyone at k_low, then assign extra bands
+        # to the (patch, band) slots with highest marginal utility.
+        # Done with a threshold on a static score matrix — fully XLA-safe.
+        max_k = num_bands
+        extra_total = int(budget_bands) - P * int(k_low)
+        if extra_total <= 0:
+            return torch.full((B, P), int(k_low), dtype=torch.long, device=device)
 
-        max_extra = num_bands - int(k_low)
-        utility_patch = patch_signal * patch_weights.unsqueeze(0)
-        sig_sq = utility_patch.pow(2)
-        bs_sq = band_weights[int(k_low):].pow(2)
-        flat = (sig_sq.unsqueeze(-1) * bs_sq.view(1, 1, -1)).reshape(B, -1)
-        extra = min(extra, flat.shape[1])
-        top_idx = torch.topk(flat, k=extra, dim=1, largest=True, sorted=False).indices
-        patch_ids = torch.div(top_idx, max_extra, rounding_mode="floor")
-        k_alloc.scatter_add_(1, patch_ids, torch.ones_like(patch_ids))
-        return k_alloc.clamp_(int(k_low), int(num_bands))
+        # Score matrix (B, P, extra_bands): marginal utility of each extra band
+        extra_bands = max_k - int(k_low)          # number of band increments possible
+        bs_extra = band_weights[int(k_low):]       # (extra_bands,)
+        # (B, P, extra_bands)
+        scores_3d = utility.unsqueeze(-1) * bs_extra.view(1, 1, -1)
+        # Flatten to (B, P*extra_bands), find threshold via topk
+        flat = scores_3d.reshape(B, P * extra_bands)
+        k_budget = min(int(extra_total), P * extra_bands)
+        threshold = torch.topk(flat, k=k_budget, dim=1, largest=True, sorted=True).values[:, -1:]  # (B, 1)
+        # Each patch gets the number of extra bands whose score > threshold
+        band_granted = (scores_3d > threshold.unsqueeze(-1)).sum(dim=-1)  # (B, P)
+        k_alloc = (int(k_low) + band_granted).clamp(int(k_low), int(num_bands))
+        return k_alloc.long()
 
+    # Binary fidelity: top-q patches get K_high, rest get k_low
     assert K_high is not None and q is not None
     if patch_policy == "random":
         scores = torch.rand(B, P, device=device)
     elif patch_policy == "static":
         scores = patch_weights.unsqueeze(0).expand(B, P)
     else:
-        scores = patch_signal * patch_weights.unsqueeze(0)
+        scores = utility
     important = _topk_mask(scores, int(q))
     return torch.where(
         important,
@@ -255,22 +267,33 @@ def compute_k_allocation(
 def apply_k_allocation(
     coeffs: torch.Tensor,
     k_alloc: torch.Tensor,
-    zz: torch.Tensor,
-    inv_zz: torch.Tensor,
     num_bands: int,
 ):
-    """Mask block-DCT coefficients according to per-patch K allocation."""
+    """
+    XLA-safe frequency masking using a static positional cutoff.
+
+    Replaces dynamic index_select zig-zag reordering with a broadcasted
+    boolean mask over zig-zag band position, which compiles statically.
+
+    Args:
+        coeffs:    (B, P, C, bs_h, bs_w) block-DCT coefficients.
+        k_alloc:   (B, P) int64 — number of bands to keep per patch.
+        num_bands: Total number of bands.
+    Returns:
+        (B, P, C, bs_h, bs_w) masked coefficients.
+    """
     B, P, C, bs_h, bs_w = coeffs.shape
     total_coeffs = bs_h * bs_w
     band_size = total_coeffs // num_bands
 
+    # Position index in the flattened coefficient space (zig-zag implicit in ordering)
+    # Shape: (1, 1, 1, total_coeffs) broadcast over (B, P, C, total_coeffs)
+    pos = torch.arange(total_coeffs, device=coeffs.device, dtype=torch.long).view(1, 1, 1, total_coeffs)
+    cutoff = (k_alloc * band_size).view(B, P, 1, 1)  # (B, P, 1, 1)
+    mask = (pos < cutoff).unsqueeze(2)               # (B, P, 1, 1, total_coeffs) -- broadcast over C
+
     coeffs_flat = coeffs.reshape(B, P, C, total_coeffs)
-    coeffs_zz = coeffs_flat.index_select(-1, zz)
-    pos = torch.arange(total_coeffs, device=coeffs.device).view(1, 1, 1, total_coeffs)
-    cutoff = (k_alloc * band_size).unsqueeze(2)
-    mask = pos < cutoff
-    coeffs_zz = coeffs_zz * mask
-    coeffs_masked = coeffs_zz.index_select(-1, inv_zz)
+    coeffs_masked = coeffs_flat * mask.float()
     return coeffs_masked.reshape(B, P, C, bs_h, bs_w)
 
 
@@ -302,10 +325,6 @@ def train_process(index, args):
     train_steps = math.ceil(args.train_samples / global_bs)
     val_steps = math.ceil(args.val_samples / (args.eval_batch_size * world_size))
     pilot_steps = max(1, int(train_steps * args.pilot_ratio))
-
-    zz = zigzag_order(args.block_size, args.block_size).to(device)
-    inv_zz = torch.empty_like(zz)
-    inv_zz[zz] = torch.arange(zz.numel(), device=device)
 
     if xm.is_master_ordinal():
         print("=" * 72)
@@ -424,7 +443,7 @@ def train_process(index, args):
                     patch_policy=args.patch_policy, K_high=K_high, q=q_e
                 )
 
-            coeffs_masked = apply_k_allocation(coeffs, k_alloc, zz, inv_zz, args.num_bands)
+            coeffs_masked = apply_k_allocation(coeffs, k_alloc, args.num_bands)
             x = block_idct2d(coeffs_masked, nph, npw)
 
             opt.zero_grad(set_to_none=True)
