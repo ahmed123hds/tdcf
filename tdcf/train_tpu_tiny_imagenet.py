@@ -16,7 +16,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 
 # Re-use our components
 from tdcf.sensitivity import SensitivityEstimator
-from tdcf.fidelity import FidelitySchedule
+from tdcf.scheduler import FidelityScheduler
 from tdcf.io_dataloader import BlockBandStore
 
 # Tiny ImageNet constants
@@ -125,7 +125,7 @@ def train_tpu_process(index, args):
 
     # ── 3. TDCF Components ──
     estimator = SensitivityEstimator(P, NUM_BANDS)
-    fsched = FidelitySchedule(args.total_epochs, args.pilot_epochs, NUM_BANDS, P, args.eta_f, args.eta_s)
+    fsched = FidelityScheduler(NUM_BANDS, P, args.eta_f, args.eta_s)
 
     # --- PILOT PHASE ---
     if is_master:
@@ -134,24 +134,28 @@ def train_tpu_process(index, args):
     for ep in range(args.pilot_epochs):
         model.train()
         train_store.set_fidelity(K_high=NUM_BANDS, K_low=NUM_BANDS, q=P)
-        
-        # Wrap loader for XLA
+
         para_loader = pl.MpDeviceLoader(train_loader, device)
-        
+
         for coeffs, y in para_loader:
-            coeffs.requires_grad_(True)
+            coeffs = coeffs.detach().requires_grad_(True)
             logits = model(coeffs)
             loss = crit(logits, y)
-            
             loss.backward()
             xm.optimizer_step(opt)
             opt.zero_grad()
-            
-            estimator.update(coeffs.grad)
-            
+
+            if coeffs.grad is not None:
+                estimator.update(coeffs.grad.cpu())
+
         estimator.finalize_epoch()
         if is_master:
             print(f"  Pilot {ep+1}/{args.pilot_epochs} completed.")
+
+    # Fit the schedule from pilot statistics
+    fsched.fit_from_pilot(estimator, args.total_epochs)
+    if is_master:
+        print(fsched.summary())
 
     if is_master:
         print(f"\n[ADAPTIVE TRAINING PHASE]")
