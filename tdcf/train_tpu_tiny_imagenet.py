@@ -1,5 +1,7 @@
 import os
 import argparse
+import sys
+import traceback
 import numpy as np
 import torch
 import torch.nn as nn
@@ -61,15 +63,19 @@ def augment_tiny_batch(x: torch.Tensor) -> torch.Tensor:
 
     # Random crop with 8-pixel padding.
     x_pad = torch.nn.functional.pad(x, (8, 8, 8, 8))
-    crop_grid = (
-        x_pad.unfold(2, H_img, 1)
-        .unfold(3, W_img, 1)
-        .permute(0, 2, 3, 1, 4, 5)
-    )
     top = torch.randint(0, 17, (B,), device=x.device)
     left = torch.randint(0, 17, (B,), device=x.device)
-    batch_idx = torch.arange(B, device=x.device)
-    x = crop_grid[batch_idx, top, left]
+    row_base = torch.arange(H_img, device=x.device)
+    col_base = torch.arange(W_img, device=x.device)
+
+    # Gather rows/cols directly instead of materializing the full unfold grid.
+    row_idx = (top[:, None] + row_base[None, :])[:, None, :, None]
+    row_idx = row_idx.expand(B, x_pad.size(1), H_img, x_pad.size(3))
+    x = x_pad.gather(2, row_idx)
+
+    col_idx = (left[:, None] + col_base[None, :])[:, None, None, :]
+    col_idx = col_idx.expand(B, x.size(1), H_img, W_img)
+    x = x.gather(3, col_idx)
 
     # Random horizontal flip.
     flip_mask = torch.rand(B, device=x.device) < 0.5
@@ -354,6 +360,17 @@ def train_tpu_process(index, args):
         # xm.save(model.state_dict(), os.path.join(args.save_dir, "model.pt"))
 
 
+def train_tpu_process_entry(index, args):
+    try:
+        train_tpu_process(index, args)
+    except Exception:
+        print(f"[rank {index}] Unhandled exception in TPU worker", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="./data/tiny_imagenet_block_store")
@@ -379,4 +396,4 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
 
     # Spawn 8 processes for TPU v4-8
-    xmp.spawn(train_tpu_process, args=(args,), nprocs=8, start_method="spawn")
+    xmp.spawn(train_tpu_process_entry, args=(args,), nprocs=8, start_method="spawn")
