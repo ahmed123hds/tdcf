@@ -19,7 +19,7 @@ from torchvision import datasets, transforms as T
 
 from .models import make_model
 from .sensitivity import SensitivityEstimator, BlockSensitivityEstimator
-from .scheduler import FidelityScheduler
+from .scheduler import FidelityScheduler, BudgetScheduler
 from .dataloader import TDCFServer
 from .io_dataloader import BandShardedStore, PhysicalTDCFStore, BlockBandStore
 from .storage import (
@@ -90,6 +90,12 @@ def parse_args():
                    help="Bands for background patches in Block-DCT mode (default=1=DC only).")
     p.add_argument("--patch_policy", choices=["gradient", "random", "static", "greedy"], default="gradient",
                    help="Policy for picking the q important patches. gradient=TDCF, random=random, static=fixed, greedy=variable-K.")
+    p.add_argument("--budget_mode", action="store_true",
+                   help="Use budget-constrained scheduler instead of coverage thresholds.")
+    p.add_argument("--beta", type=float, default=0.5,
+                   help="Starting budget ratio (0 < β < 1). Only used with --budget_mode.")
+    p.add_argument("--gamma", type=float, default=1.5,
+                   help="Ramp exponent. γ=1 linear, γ>1 hold-then-ramp. Only with --budget_mode.")
     return p.parse_args()
 
 
@@ -419,7 +425,10 @@ def run_tdcf(args, log):
               args.pilot_epochs, args.batch_size, args.eta_f, args.eta_s, log)
 
     # ── fit schedule ──
-    fsched = FidelityScheduler(NUM_BANDS, estimator.P, args.eta_f, args.eta_s)
+    if args.budget_mode:
+        fsched = BudgetScheduler(NUM_BANDS, estimator.P, beta=args.beta, gamma=args.gamma, k_low=args.k_low)
+    else:
+        fsched = FidelityScheduler(NUM_BANDS, estimator.P, args.eta_f, args.eta_s)
     fsched.fit_from_pilot(estimator, args.total_epochs)
     log.info("\n%s\n", fsched.summary())
     residual_k_values = None
@@ -475,7 +484,14 @@ def run_tdcf(args, log):
     hist = {k: [] for k in hist_keys}
 
     for ep in range(args.total_epochs):
-        K_e, q_e = fsched.get_fidelity(ep)
+        if args.budget_mode:
+            if not args.block_dct:
+                raise NotImplementedError("--budget_mode currently requires --block_dct")
+            budget = fsched.get_budget(ep)
+            K_e, q_e = NUM_BANDS, estimator.P
+        else:
+            K_e, q_e = fsched.get_fidelity(ep)
+            train_server.set_fidelity(K_e, args.k_low, q_e, args.patch_policy)
         ps_idx   = min(ep, len(estimator.patch_sensitivity_history)-1)
         ps       = (estimator.patch_sensitivity_history[ps_idx]
                     if estimator.patch_sensitivity_history else None)
@@ -800,7 +816,10 @@ def run_tdcf_block(args, log):
                  bs[0], bs[-1])
 
     # ── fit schedule ──
-    fsched = FidelityScheduler(NUM_BANDS, estimator.P, args.eta_f, args.eta_s)
+    if args.budget_mode:
+        fsched = BudgetScheduler(NUM_BANDS, estimator.P, beta=args.beta, gamma=args.gamma, k_low=args.k_low)
+    else:
+        fsched = FidelityScheduler(NUM_BANDS, estimator.P, args.eta_f, args.eta_s)
     fsched.fit_from_pilot(estimator, args.total_epochs)
     log.info("\n%s\n", fsched.summary())
 
@@ -844,15 +863,22 @@ def run_tdcf_block(args, log):
     hist = {k: [] for k in hist_keys}
 
     for ep in range(args.total_epochs):
-        K_high, q_e = fsched.get_fidelity(ep)
         ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
         ps = estimator.patch_sensitivity_history[ps_idx]
-
-        # Update store fidelity with the chosen policy
         bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
         bs = estimator.band_sensitivity_history[bs_idx]
-        train_store.set_fidelity(K_high, K_low, q_e, patch_sensitivity=ps,
-                                 band_sensitivity=bs, patch_policy=args.patch_policy)
+
+        if args.budget_mode:
+            budget = fsched.get_budget(ep)
+            train_store.set_budget(
+                budget, patch_sensitivity=ps,
+                band_sensitivity=bs, k_low=args.k_low,
+            )
+            K_high, q_e = NUM_BANDS, estimator.P  # For logging
+        else:
+            K_high, q_e = fsched.get_fidelity(ep)
+            train_store.set_fidelity(K_high, K_low, q_e, patch_sensitivity=ps,
+                                     band_sensitivity=bs, patch_policy=args.patch_policy)
         io_ratio = train_store.get_io_ratio()
         train_store.reset_epoch_io()
         test_store.reset_epoch_io()
