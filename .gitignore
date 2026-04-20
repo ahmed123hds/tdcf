@@ -1,0 +1,10 @@
+data/
+results/
+__pycache__/
+*.pyc
+.env
+.venv
+pytorch_env/
+*.pt
+*.pth
+.DS_Store
