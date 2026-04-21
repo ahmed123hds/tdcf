@@ -4,6 +4,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
+def _use_safe_style():
+    for style in ("seaborn-v0_8-muted", "seaborn", "ggplot", "default"):
+        try:
+            plt.style.use(style)
+            return
+        except OSError:
+            continue
+
 def generate_dashboard(results_path, out_path):
     with open(results_path, "r") as f:
         data = json.load(f)
@@ -35,7 +43,7 @@ def generate_dashboard(results_path, out_path):
     fs = MockFs(data)
     backbone = data["config"]["backbone"]
 
-    plt.style.use('seaborn-v0_8-muted')
+    _use_safe_style()
     fig = plt.figure(figsize=(20, 14))
     fig.suptitle(f"TDCF on CIFAR-100 — {backbone.upper()} backbone", 
                  fontsize=22, fontweight="bold", y=0.98)

@@ -92,6 +92,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save_every", type=int, default=10)
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from latest.pt checkpoint in --save_dir.")
     return p.parse_args()
 
 
@@ -408,9 +410,27 @@ def train_process(index, args):
     sched_lr = make_scheduler(args, opt, args.epochs)
 
     best_acc = 0.0
+    start_epoch = 0
     os.makedirs(args.save_dir, exist_ok=True)
 
-    for ep in range(args.epochs):
+    # Resume from checkpoint if requested
+    ckpt_path = os.path.join(args.save_dir, "latest.pt")
+    if args.resume and os.path.isfile(ckpt_path):
+        if xm.is_master_ordinal():
+            print(f"\n[RESUME] Loading checkpoint from {ckpt_path}")
+        ckpt_data = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(ckpt_data["state_dict"])
+        opt.load_state_dict(ckpt_data["optimizer"])
+        sched_lr.load_state_dict(ckpt_data["scheduler"])
+        start_epoch = ckpt_data["epoch"]   # already-completed epochs
+        best_acc = ckpt_data.get("best_acc", 0.0)
+        if xm.is_master_ordinal():
+            print(f"[RESUME] Resuming from epoch {start_epoch + 1} | best_acc={best_acc:.4f}")
+    elif args.resume:
+        if xm.is_master_ordinal():
+            print(f"[RESUME] No checkpoint found at {ckpt_path}, starting from scratch.")
+
+    for ep in range(start_epoch, args.epochs):
         if not args.skip_pilot:
             ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
             bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
