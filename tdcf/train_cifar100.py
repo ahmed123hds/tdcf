@@ -706,12 +706,23 @@ def save_plots(ht, hb, est, fs, save_dir, args):
     ax.set(xlabel="Epoch", ylabel="Loss", title="Training Loss")
     ax.legend(); ax.grid(True, alpha=.3)
 
-    # 3 — monotone schedule
+    budget_schedule = None
+    if hasattr(fs, "get_budget_schedule"):
+        budget_schedule = fs.get_budget_schedule()
+
+    # 3 — monotone schedule / budget
     ax = fig.add_subplot(gs[0,2])
-    Ks, qs = fs.get_full_schedule()
-    ax.plot(Ks, "o-", c="#4CAF50", lw=2, ms=3, label="K(e) bands")
-    ax.plot(qs, "s-", c="#9C27B0", lw=2, ms=3, label="q(e) patches")
-    ax.set(xlabel="Epoch", ylabel="Count", title="Monotone Fidelity Schedule K(e) & q(e)")
+    if budget_schedule is not None:
+        ax.plot(ht["epoch"], budget_schedule, "o-", c="#4CAF50", lw=2, ms=3,
+                label="Budget(e) band-slots")
+        ax.set(xlabel="Epoch", ylabel="Band-slots",
+               title="Budget Schedule")
+    else:
+        Ks, qs = fs.get_full_schedule()
+        ax.plot(Ks, "o-", c="#4CAF50", lw=2, ms=3, label="K(e) bands")
+        ax.plot(qs, "s-", c="#9C27B0", lw=2, ms=3, label="q(e) patches")
+        ax.set(xlabel="Epoch", ylabel="Count",
+               title="Monotone Fidelity Schedule K(e) & q(e)")
     ax.legend(); ax.grid(True, alpha=.3)
 
     # 4 — approx ratio
@@ -770,7 +781,8 @@ def save_plots(ht, hb, est, fs, save_dir, args):
     ax.plot(ht["epoch"], ht["lr"], "o-", c="#00BCD4", lw=2, ms=3)
     ax.set(xlabel="Epoch", ylabel="LR", title="Learning Rate"); ax.grid(True, alpha=.3)
 
-    fig.savefig(os.path.join(save_dir, "tdcf_cifar100_results.png"), dpi=200, bbox_inches="tight")
+    fig.savefig(os.path.join(save_dir, "tdcf_cifar100_results.png"),
+                dpi=200, bbox_inches="tight")
     plt.close()
 
 
@@ -910,8 +922,9 @@ def run_tdcf_block(args, log):
             train_store.set_budget(
                 budget, patch_sensitivity=ps,
                 band_sensitivity=bs, k_low=args.k_low,
+                patch_policy=args.patch_policy,
             )
-            K_high, q_e = NUM_BANDS, estimator.P  # For logging
+            K_high, q_e = train_store.K_high, train_store.q
         else:
             K_high, q_e = fsched.get_fidelity(ep)
             train_store.set_fidelity(K_high, K_low, q_e, patch_sensitivity=ps,
@@ -997,12 +1010,25 @@ def main():
         "config": vars(args),
     }
     if not args.baseline_only:
+        schedule_budget = (
+            fs.get_budget_schedule().tolist()
+            if hasattr(fs, "get_budget_schedule") else []
+        )
+        schedule_K = (
+            fs.get_full_schedule()[0].tolist()
+            if hasattr(fs, "get_full_schedule") else []
+        )
+        schedule_q = (
+            fs.get_full_schedule()[1].tolist()
+            if hasattr(fs, "get_full_schedule") else []
+        )
         results.update({
             "tdcf": ht,
             "band_sensitivity":  [s.tolist() for s in est.band_sensitivity_history] if est else [],
             "patch_sensitivity": [s.tolist() for s in est.patch_sensitivity_history] if est else [],
-            "schedule_K": fs.get_full_schedule()[0].tolist() if fs else [],
-            "schedule_q": fs.get_full_schedule()[1].tolist() if fs else [],
+            "schedule_K": schedule_K,
+            "schedule_q": schedule_q,
+            "schedule_budget": schedule_budget,
         })
         torch.save(model_t.state_dict(), os.path.join(args.save_dir, "model_tdcf.pt"))
     
@@ -1019,6 +1045,9 @@ def main():
     with open(os.path.join(args.save_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2, cls=_NpEncoder)
 
+    if not args.baseline_only:
+        save_plots(ht, hb, est, fs, args.save_dir, args)
+
     # ── final summary ──
     log.info("\n" + "="*60)
     log.info("FINAL RESULTS")
@@ -1033,14 +1062,15 @@ def main():
             log.info("  Accuracy drop:        %+.4f", ht["test_acc"][-1] - hb["test_acc"][-1])
     if not args.baseline_only:
         avg_io = np.mean(ht.get("io_ratio", ht.get("approx_ratio", [1.0])))
-    log.info("  Avg I/O ratio:        %.3f  (%.1f%% I/O saved)",
-             avg_io, (1 - avg_io) * 100)
-    if "io_bytes" in ht:
-        log.info("  Avg I/O bytes/epoch:  %.1f MB", np.mean(ht["io_bytes"]) / 1e6)
-    log.info("  TDCF wall time:       %.0fs", ht["wall_s"][-1])
+        log.info("  Avg I/O ratio:        %.3f  (%.1f%% I/O saved)",
+                 avg_io, (1 - avg_io) * 100)
+        if "io_bytes" in ht:
+            log.info("  Avg I/O bytes/epoch:  %.1f MB", np.mean(ht["io_bytes"]) / 1e6)
+        log.info("  TDCF wall time:       %.0fs", ht["wall_s"][-1])
     if hb:
         log.info("  Base wall time:       %.0fs", hb["wall_s"][-1])
-    log.info("  Schedule:\n%s", fs.summary())
+    if fs is not None:
+        log.info("  Schedule:\n%s", fs.summary())
     log.info("  Results → %s/", args.save_dir)
 
 

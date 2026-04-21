@@ -228,6 +228,15 @@ class BudgetScheduler:
         """Fraction of full I/O used at this epoch."""
         return self.get_budget(epoch) / self.full_budget
 
+    def get_budget_schedule(self) -> np.ndarray:
+        """Return the full per-epoch band-slot budget schedule."""
+        if self._total_epochs is None:
+            raise RuntimeError("Schedule not fitted yet. Call fit_from_pilot.")
+        return np.array(
+            [self.get_budget(e) for e in range(self._total_epochs)],
+            dtype=np.int64,
+        )
+
     def summary(self) -> str:
         if self._total_epochs is None:
             return "BudgetScheduler not fitted."

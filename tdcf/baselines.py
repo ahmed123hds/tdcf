@@ -417,13 +417,20 @@ def main():
     with open(args.tdcf_results) as f:
         tdcf_res = json.load(f)
 
-    tdcf_avg_ratio = float(np.mean(tdcf_res["tdcf"]["approx_ratio"]))
-    tdcf_K_schedule = [int(K) for K in tdcf_res["schedule_K"]]
-    tdcf_q_schedule = [int(q) for q in tdcf_res["schedule_q"]]
-    tdcf_K = int(np.median(tdcf_K_schedule))
-    tdcf_q = int(np.median(tdcf_q_schedule))
+    tdcf_hist = tdcf_res["tdcf"]
+    ratio_hist = tdcf_hist.get("approx_ratio", tdcf_hist.get("io_ratio", [1.0]))
+    tdcf_avg_ratio = float(np.mean(ratio_hist))
+    tdcf_K_schedule = [int(K) for K in tdcf_res.get("schedule_K", [])]
+    tdcf_q_schedule = [int(q) for q in tdcf_res.get("schedule_q", [])]
     static_lowpass_K, static_lowpass_ratio = match_static_lowpass(tdcf_avg_ratio)
     static_kq_K, static_kq_q, static_kq_ratio = match_static_kq(tdcf_avg_ratio)
+
+    if not tdcf_K_schedule:
+        tdcf_K_schedule = [static_kq_K] * args.total_epochs
+    if not tdcf_q_schedule:
+        tdcf_q_schedule = [static_kq_q] * args.total_epochs
+    tdcf_K = int(np.median(tdcf_K_schedule))
+    tdcf_q = int(np.median(tdcf_q_schedule))
 
     log.info("TDCF reference: avg_ratio=%.3f  median(K,q)=(%d,%d)",
              tdcf_avg_ratio, tdcf_K, tdcf_q)

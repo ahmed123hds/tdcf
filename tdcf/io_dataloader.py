@@ -540,7 +540,8 @@ class BlockBandStore:
     def set_budget(self, total_bands: int,
                    patch_sensitivity: np.ndarray = None,
                    band_sensitivity: np.ndarray = None,
-                   k_low: int = 1):
+                   k_low: int = 1,
+                   patch_policy: str = 'greedy'):
         """
         Budget-constrained fidelity allocation.
 
@@ -560,9 +561,18 @@ class BlockBandStore:
         self.budget_bands = max(self.P * k_low,
                                 min(total_bands, self.P * self.num_bands))
         self.K_low = k_low
-        self.K_high = self.num_bands  # greedy will decide actual K per patch
-        self.q = self.P              # greedy handles all patches
-        self.patch_policy = 'greedy'
+        self.patch_policy = patch_policy
+
+        if patch_policy == 'greedy':
+            self.K_high = self.num_bands  # greedy will decide actual K per patch
+            self.q = self.P               # greedy handles all patches
+        else:
+            self.K_high = self.num_bands
+            extra_per_patch = max(self.K_high - self.K_low, 1)
+            extra_total = max(self.budget_bands - self.P * self.K_low, 0)
+            self.q = int(np.clip(
+                round(extra_total / extra_per_patch), 0, self.P
+            ))
 
         self.n_coeffs_high = self.K_high * self.band_size
         self.n_coeffs_low = self.K_low * self.band_size
@@ -585,6 +595,8 @@ class BlockBandStore:
         """
         B = len(indices)
 
+        if self.q <= 0:
+            return np.zeros((B, self.P), dtype=bool)
         if self.q >= self.P:
             return np.ones((B, self.P), dtype=bool)
 
