@@ -165,12 +165,15 @@ def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
             shardshuffle=is_training,
             nodesplitter=wds.split_by_node,
         )
+        .compose(wds.split_by_worker)
         .shuffle(5000 if is_training else 0)
         .decode("pil")
         .to_tuple("jpg;jpeg;png", "cls")
         .map_tuple(transform, identity_label)
         .batched(batch_size, partial=not is_training)
     )
+    if is_training:
+        dataset = dataset.with_epoch(math.ceil(args.train_samples / (batch_size * xm.xrt_world_size())))
 
     return wds.WebLoader(
         dataset,
