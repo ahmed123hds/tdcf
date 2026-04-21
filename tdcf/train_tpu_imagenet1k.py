@@ -317,8 +317,10 @@ def accumulate_block_sensitivity(estimator, coeffs_grad: torch.Tensor):
 def train_process(index, args):
     device = xm.xla_device()
     world_size = xm.xrt_world_size()
-    torch.manual_seed(args.seed + index)
-    np.random.seed(args.seed + index)
+    core_seed = args.seed + xm.get_ordinal()
+    torch.manual_seed(core_seed)
+    np.random.seed(core_seed)
+    random.seed(core_seed)
 
     global_bs = args.batch_size * world_size
     scaled_lr = args.base_lr * (global_bs / float(args.lr_ref_batch))
