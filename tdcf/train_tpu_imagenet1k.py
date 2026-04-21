@@ -286,11 +286,11 @@ def apply_k_allocation(
     total_coeffs = bs_h * bs_w
     band_size = total_coeffs // num_bands
 
-    # Position index in the flattened coefficient space (zig-zag implicit in ordering)
-    # Shape: (1, 1, 1, total_coeffs) broadcast over (B, P, C, total_coeffs)
+    # pos: (1, 1, 1, total_coeffs),  cutoff: (B, P, 1, 1)
+    # mask: (B, P, 1, total_coeffs) broadcasts over C dimension
     pos = torch.arange(total_coeffs, device=coeffs.device, dtype=torch.long).view(1, 1, 1, total_coeffs)
     cutoff = (k_alloc * band_size).view(B, P, 1, 1)  # (B, P, 1, 1)
-    mask = (pos < cutoff).unsqueeze(2)               # (B, P, 1, 1, total_coeffs) -- broadcast over C
+    mask = (pos < cutoff)  # (B, P, 1, total_coeffs) — broadcasts over C
 
     coeffs_flat = coeffs.reshape(B, P, C, total_coeffs)
     coeffs_masked = coeffs_flat * mask.float()
