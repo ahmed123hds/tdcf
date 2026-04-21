@@ -510,7 +510,15 @@ def train_process(index, args):
         sched_lr.step()
 
         if xm.is_master_ordinal():
-            if args.budget_mode:
+            if args.skip_pilot:
+                print(
+                    f"E {ep+1:3d}/{args.epochs} | IO=1.000 (baseline) | "
+                    f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
+                    f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} | "
+                    f"LR={opt.param_groups[0]['lr']:.2e}",
+                    flush=True,
+                )
+            elif args.budget_mode:
                 print(
                     f"E {ep+1:3d}/{args.epochs} | Budget={budget:4d}/{total_budget} | "
                     f"IO={io_ratio:.3f} | Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
