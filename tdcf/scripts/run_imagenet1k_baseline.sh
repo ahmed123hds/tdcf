@@ -26,12 +26,12 @@ while [ $attempt -lt $MAX_RETRIES ]; do
     echo "[$(date)] Attempt $attempt / $MAX_RETRIES"
     echo "============================================================"
 
-    if [ "$FIRST_RUN" = true ]; then
-        RESUME_FLAG=""
-        FIRST_RUN=false
-    else
+    if [ -f "$SAVE_DIR/latest.pt" ]; then
         RESUME_FLAG="--resume"
-        echo "[$(date)] Resuming from checkpoint in $SAVE_DIR ..."
+        echo "[$(date)] Found existing checkpoint. Resuming from $SAVE_DIR ..."
+    else
+        RESUME_FLAG=""
+        echo "[$(date)] No checkpoint found. Starting fresh run ..."
     fi
 
     # Run training — exits 0 on success, non-zero on preemption/crash
