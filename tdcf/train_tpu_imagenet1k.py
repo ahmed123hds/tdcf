@@ -56,6 +56,8 @@ def parse_args():
     p.add_argument("--eval_batch_size", type=int, default=64, help="Per TPU core")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--pilot_epochs", type=int, default=10)
+    p.add_argument("--skip_pilot", action="store_true",
+                   help="Skip pilot phase entirely and run full fidelity (for baseline runs).")
     p.add_argument("--pilot_ratio", type=float, default=0.10,
                    help="Fraction of an epoch used for each pilot epoch.")
     p.add_argument("--base_lr", type=float, default=0.1,
@@ -351,51 +353,55 @@ def train_process(index, args):
     val_loader = build_wds_loader(args.val_shards, args.eval_batch_size, args, False)
 
     # Pilot
-    if xm.is_master_ordinal():
-        print(f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, ~{pilot_steps} steps/epoch")
-
-    for ep in range(args.pilot_epochs):
-        pl_pilot = pl.ParallelLoader(pilot_loader, [device])
-        para_pilot = pl_pilot.per_device_loader(device)
-        model.train()
-
-        for step, batch in enumerate(para_pilot):
-            if step >= pilot_steps:
-                break
-            images, labels = batch
-            labels = labels.long()
-            coeffs = block_dct2d(images, block_size=args.block_size).detach().requires_grad_(True)
-            x = block_idct2d(coeffs, nph, npw)
-
-            pilot_opt.zero_grad(set_to_none=True)
-            with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
-                logits = model(x)
-                loss = criterion(logits, labels)
-            loss.backward()
-
-            if coeffs.grad is not None:
-                accumulate_block_sensitivity(estimator, coeffs.grad)
-
-            xm.reduce_gradients(pilot_opt)
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            xm.optimizer_step(pilot_opt)
-
-        estimator.finalize_epoch()
+    if not args.skip_pilot:
         if xm.is_master_ordinal():
-            K = estimator.compute_band_cutoff(ep, args.eta_f)
-            q = estimator.compute_patch_quota(ep, args.eta_s)
-            bs = estimator.band_sensitivity_history[ep]
-            print(
-                f"  Pilot {ep+1:2d}/{args.pilot_epochs} | "
-                f"K_high={K:2d}/{args.num_bands} | q={q:3d}/{num_patches} | "
-                f"band_low={bs[0]:.4f} band_high={bs[-1]:.4f}"
-            )
+            print(f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, ~{pilot_steps} steps/epoch")
 
-    scheduler.fit_from_pilot(estimator, args.epochs)
-    if xm.is_master_ordinal():
-        print(scheduler.summary())
-        print("\n[ADAPTIVE TRAINING PHASE]")
+        for ep in range(args.pilot_epochs):
+            pl_pilot = pl.ParallelLoader(pilot_loader, [device])
+            para_pilot = pl_pilot.per_device_loader(device)
+            model.train()
+
+            for step, batch in enumerate(para_pilot):
+                if step >= pilot_steps:
+                    break
+                images, labels = batch
+                labels = labels.long()
+                coeffs = block_dct2d(images, block_size=args.block_size).detach().requires_grad_(True)
+                x = block_idct2d(coeffs, nph, npw)
+
+                pilot_opt.zero_grad(set_to_none=True)
+                with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
+                    logits = model(x)
+                    loss = criterion(logits, labels)
+                loss.backward()
+
+                if coeffs.grad is not None:
+                    accumulate_block_sensitivity(estimator, coeffs.grad)
+
+                xm.reduce_gradients(pilot_opt)
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                xm.optimizer_step(pilot_opt)
+
+            estimator.finalize_epoch()
+            if xm.is_master_ordinal():
+                K = estimator.compute_band_cutoff(ep, args.eta_f)
+                q = estimator.compute_patch_quota(ep, args.eta_s)
+                bs = estimator.band_sensitivity_history[ep]
+                print(
+                    f"  Pilot {ep+1:2d}/{args.pilot_epochs} | "
+                    f"K_high={K:2d}/{args.num_bands} | q={q:3d}/{num_patches} | "
+                    f"band_low={bs[0]:.4f} band_high={bs[-1]:.4f}"
+                )
+
+        scheduler.fit_from_pilot(estimator, args.epochs)
+        if xm.is_master_ordinal():
+            print(scheduler.summary())
+            print("\n[ADAPTIVE TRAINING PHASE]")
+    else:
+        if xm.is_master_ordinal():
+            print("\n[SKIP PILOT] - Proceeding directly to baseline training.")
 
     # Fresh optimizer after pilot.
     opt = make_optimizer(args, model, scaled_lr)
@@ -405,12 +411,17 @@ def train_process(index, args):
     os.makedirs(args.save_dir, exist_ok=True)
 
     for ep in range(args.epochs):
-        ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
-        bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
-        ps = estimator.patch_sensitivity_history[ps_idx]
-        bs = estimator.band_sensitivity_history[bs_idx]
+        if not args.skip_pilot:
+            ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
+            bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
+            ps = estimator.patch_sensitivity_history[ps_idx]
+            bs = estimator.band_sensitivity_history[bs_idx]
 
-        if args.budget_mode:
+        if args.skip_pilot:
+            budget = total_budget
+            io_ratio = 1.0
+            K_high = q_e = None
+        elif args.budget_mode:
             budget = scheduler.get_budget(ep)
             io_ratio = scheduler.get_io_ratio(ep)
             K_high = q_e = None
@@ -432,19 +443,22 @@ def train_process(index, args):
             labels = labels.long()
             coeffs = block_dct2d(images, block_size=args.block_size)
 
-            if args.budget_mode:
-                k_alloc = compute_k_allocation(
-                    coeffs, ps, bs, args.num_bands, args.k_low,
-                    patch_policy="greedy", budget_bands=budget
-                )
+            if args.skip_pilot:
+                # Bypass masking entirely for baseline
+                x = block_idct2d(coeffs, nph, npw)
             else:
-                k_alloc = compute_k_allocation(
-                    coeffs, ps, bs, args.num_bands, args.k_low,
-                    patch_policy=args.patch_policy, K_high=K_high, q=q_e
-                )
-
-            coeffs_masked = apply_k_allocation(coeffs, k_alloc, args.num_bands)
-            x = block_idct2d(coeffs_masked, nph, npw)
+                if args.budget_mode:
+                    k_alloc = compute_k_allocation(
+                        coeffs, ps, bs, args.num_bands, args.k_low,
+                        patch_policy="greedy", budget_bands=budget
+                    )
+                else:
+                    k_alloc = compute_k_allocation(
+                        coeffs, ps, bs, args.num_bands, args.k_low,
+                        patch_policy=args.patch_policy, K_high=K_high, q=q_e
+                    )
+                coeffs_masked = apply_k_allocation(coeffs, k_alloc, args.num_bands)
+                x = block_idct2d(coeffs_masked, nph, npw)
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):

@@ -1,4 +1,5 @@
-import os, json, torch
+import argparse
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -27,6 +28,7 @@ def generate_combined_dashboard(tdcf_path, base_path, out_path):
         def __init__(self, data):
             self.K = np.array(data.get("schedule_K", []))
             self.q = np.array(data.get("schedule_q", []))
+            self.budget = np.array(data.get("schedule_budget", []))
 
     est = MockEst(tdcf_data)
     fs = MockFs(tdcf_data)
@@ -57,12 +59,18 @@ def generate_combined_dashboard(tdcf_path, base_path, out_path):
     ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
     ax.legend(); ax.grid(True, alpha=.3)
 
-    # 3 — Fidelity Schedule
+    # 3 — Fidelity Schedule / Budget
     ax = fig.add_subplot(gs[0,2])
-    ax.plot(fs.K, "o-", c="#4CAF50", lw=2.5, ms=4, label="K(e) bands")
-    ax.plot(fs.q, "s-", c="#9C27B0", lw=2.5, ms=4, label="q(e) patches")
-    ax.set_title("Fidelity Schedule", fontsize=15, fontweight="bold")
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Count")
+    if fs.budget.size:
+        ax.plot(np.arange(1, len(fs.budget) + 1), fs.budget,
+                "o-", c="#4CAF50", lw=2.5, ms=4, label="Budget(e)")
+        ax.set_title("Budget Schedule", fontsize=15, fontweight="bold")
+        ax.set_xlabel("Epoch"); ax.set_ylabel("Band-slots")
+    else:
+        ax.plot(fs.K, "o-", c="#4CAF50", lw=2.5, ms=4, label="K(e) bands")
+        ax.plot(fs.q, "s-", c="#9C27B0", lw=2.5, ms=4, label="q(e) patches")
+        ax.set_title("Fidelity Schedule", fontsize=15, fontweight="bold")
+        ax.set_xlabel("Epoch"); ax.set_ylabel("Count")
     ax.legend(); ax.grid(True, alpha=.3)
 
     # 4 — I/O Ratio
@@ -110,9 +118,18 @@ def generate_combined_dashboard(tdcf_path, base_path, out_path):
     plt.savefig(out_path, dpi=150)
     print(f"Saved dashboard to {out_path}")
 
+def parse_args():
+    p = argparse.ArgumentParser("generate_combined_dashboard")
+    p.add_argument("tdcf_results")
+    p.add_argument("baseline_results")
+    p.add_argument("out_path")
+    return p.parse_args()
+
+
 if __name__ == '__main__':
+    args = parse_args()
     generate_combined_dashboard(
-        'results/cifar100_block_matched/results.json',
-        'results/baseline/results.json',
-        'results/cifar100_block_matched/cifar100_dashboard_combined.png'
+        args.tdcf_results,
+        args.baseline_results,
+        args.out_path,
     )
