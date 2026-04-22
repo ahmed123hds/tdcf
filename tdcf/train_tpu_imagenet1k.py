@@ -148,7 +148,6 @@ def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
         transform = T.Compose([
             T.RandomResizedCrop(args.img_size),
             T.RandomHorizontalFlip(),
-            T.RandAugment(num_ops=2, magnitude=9),
             T.ToTensor(),
             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
