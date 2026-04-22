@@ -524,6 +524,10 @@ def train_process(index, args):
                     print(f"  [Train] Epoch {ep} | Step {step:4d}/{train_steps} | Time for 100 steps: {elapsed:.2f}s | {imgs_sec:.1f} imgs/sec", flush=True)
                     step_start_time = time.time()
 
+        # Close the training ParallelLoader to release background threads
+        del para_train
+        pl_train.close()
+
         tr_n_total = xm.mesh_reduce("tr_n", tr_n, sum)
         tr_corr_total = xm.mesh_reduce("tr_corr", tr_correct, sum)
         tr_loss_total = xm.mesh_reduce("tr_loss", tr_loss_s, sum)
@@ -552,6 +556,10 @@ def train_process(index, args):
                 va_loss_s += loss * batch_n
                 va_correct += (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
                 va_n += batch_n
+
+        # Close the validation ParallelLoader to release background threads
+        del para_val
+        pl_val.close()
 
         va_n_total = xm.mesh_reduce("va_n", va_n, sum)
         va_corr_total = xm.mesh_reduce("va_corr", va_correct, sum)
