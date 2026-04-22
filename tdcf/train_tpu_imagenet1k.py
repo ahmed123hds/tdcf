@@ -188,9 +188,9 @@ def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
 
 def make_epoch_accumulators(device: torch.device):
     return (
-        torch.zeros((), device=device),
-        torch.zeros((), device=device),
-        torch.zeros((), device=device),
+        torch.zeros(1, device=device, dtype=torch.float32),
+        torch.zeros(1, device=device, dtype=torch.float32),
+        torch.zeros(1, device=device, dtype=torch.float32),
     )
 
 
@@ -504,10 +504,10 @@ def train_process(index, args):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             xm.optimizer_step(opt)
 
-            batch_n = torch.tensor(labels.size(0), device=device, dtype=torch.float32)
-            tr_loss_s += loss.detach() * batch_n
-            tr_correct += (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
-            tr_n += batch_n
+            batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
+            tr_loss_s = tr_loss_s + (loss.detach() * batch_n)
+            tr_correct = tr_correct + (logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1)
+            tr_n = tr_n + batch_n
 
             if xm.is_master_ordinal():
                 if step == 0:
@@ -552,10 +552,10 @@ def train_process(index, args):
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(images)
                     loss = criterion(logits, labels)
-                batch_n = torch.tensor(labels.size(0), device=device, dtype=torch.float32)
-                va_loss_s += loss * batch_n
-                va_correct += (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
-                va_n += batch_n
+                batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
+                va_loss_s = va_loss_s + (loss * batch_n)
+                va_correct = va_correct + (logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1)
+                va_n = va_n + batch_n
 
         # Close the validation ParallelLoader to release background threads
         del para_val
