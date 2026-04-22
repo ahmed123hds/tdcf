@@ -22,10 +22,13 @@ Usage:
 
 import os
 import json
+import math
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 from .transforms import idct2d
 
@@ -785,3 +788,190 @@ class BlockBandDataset(Dataset):
 
     def __getitem__(self, idx):
         return idx, self.store.labels[idx]
+
+
+class CropAwareBlockBandStore:
+    """
+    Crop-aware block-DCT store for large images.
+
+    Images are pre-resized to a deterministic canvas with shorter side fixed
+    (for example 256), padded to the maximum patch grid in the dataset, and
+    stored patch-by-patch in zig-zag coefficient order. At serving time the
+    store can sample a crop window, read only the overlapping patches, then
+    reconstruct the cropped region and resize it to the model's input size.
+
+    This is the physical-I/O substrate for a future ImageNet-1K store-backed
+    trainer. Phase 1 supports full-fidelity crop-aware serving and exact patch
+    byte accounting. Budgeted partial-band serving can be layered on top.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        device: torch.device = None,
+        output_size: int = 224,
+        crop_scale=(0.08, 1.0),
+        crop_ratio=(3.0 / 4.0, 4.0 / 3.0),
+    ):
+        self.root = root
+        self.device = device or torch.device("cpu")
+        self.output_size = output_size
+        self.crop_scale = crop_scale
+        self.crop_ratio = crop_ratio
+
+        with open(os.path.join(root, "metadata.json")) as f:
+            self.meta = json.load(f)
+
+        if self.meta.get("format") != "crop_aware_block_dct":
+            raise ValueError(
+                f"{root} is not a crop-aware block store "
+                f"(format={self.meta.get('format')!r})."
+            )
+
+        self.N = self.meta["N"]
+        self.C = self.meta["C"]
+        self.P = self.meta["P"]
+        self.nph = self.meta["nph"]
+        self.npw = self.meta["npw"]
+        self.bs_h = self.meta["block_size_h"]
+        self.bs_w = self.meta["block_size_w"]
+        self.total_coeffs = self.meta["total_coeffs_per_patch"]
+        self.num_bands = self.meta["num_bands_per_patch"]
+        self.band_size = self.meta["band_size"]
+        self.canvas_h = self.meta["canvas_h"]
+        self.canvas_w = self.meta["canvas_w"]
+        self.resize_shorter = self.meta["resize_shorter"]
+        self.bytes_per_sample_full = self.meta["bytes_per_sample_full"]
+
+        self.zz = np.array(self.meta["zigzag_order"], dtype=np.int64)
+        self.labels = np.load(os.path.join(root, "labels.npy"), mmap_mode="r")
+        self.sample_shapes = np.load(os.path.join(root, "sample_shapes.npy"), mmap_mode="r")
+        self.patch_signal = np.load(os.path.join(root, "patch_signal.npy"), mmap_mode="r")
+
+        self._patch_mmaps = [None] * self.P
+
+        self.bytes_read_epoch = 0
+        self.bytes_read_total = 0
+        self.samples_read_epoch = 0
+
+    def _get_patch_mmap(self, p_idx: int):
+        if self._patch_mmaps[p_idx] is None:
+            path = os.path.join(self.root, f"patch_{p_idx:03d}.npy")
+            if not os.path.exists(path):
+                path = os.path.join(self.root, f"patch_{p_idx:02d}.npy")
+            self._patch_mmaps[p_idx] = np.load(path, mmap_mode="r")
+        return self._patch_mmaps[p_idx]
+
+    def reset_epoch_io(self):
+        self.bytes_read_epoch = 0
+        self.samples_read_epoch = 0
+
+    def get_dataset(self):
+        return BlockBandDataset(self)
+
+    def get_index_loader(self, batch_size: int = 256, shuffle: bool = True,
+                         num_workers: int = 0):
+        if num_workers != 0:
+            raise ValueError(
+                "CropAwareBlockBandStore exact I/O accounting requires num_workers=0."
+            )
+        ds = self.get_dataset()
+        return DataLoader(
+            ds, batch_size=batch_size, shuffle=shuffle,
+            num_workers=0, pin_memory=False,
+        )
+
+    def _sample_crop_params(self, indices: np.ndarray):
+        params = np.zeros((len(indices), 4), dtype=np.int64)
+        for row, idx in enumerate(indices):
+            h, w = self.sample_shapes[idx]
+            dummy = torch.empty(self.C, int(h), int(w))
+            top, left, height, width = T.RandomResizedCrop.get_params(
+                dummy, scale=self.crop_scale, ratio=self.crop_ratio
+            )
+            params[row] = (top, left, height, width)
+        return params
+
+    def _patch_bbox_from_crop(self, top: int, left: int, height: int, width: int):
+        row0 = max(0, top // self.bs_h)
+        col0 = max(0, left // self.bs_w)
+        row1 = min(self.nph, math.ceil((top + height) / self.bs_h))
+        col1 = min(self.npw, math.ceil((left + width) / self.bs_w))
+        return row0, row1, col0, col1
+
+    def _read_visible_patches(self, indices: np.ndarray, crop_params: np.ndarray):
+        B = len(indices)
+        coeffs_out = np.zeros(
+            (B, self.P, self.C, self.total_coeffs), dtype=np.float32
+        )
+        visible_mask = np.zeros((B, self.P), dtype=bool)
+
+        for b, (top, left, height, width) in enumerate(crop_params):
+            row0, row1, col0, col1 = self._patch_bbox_from_crop(
+                int(top), int(left), int(height), int(width)
+            )
+            for row in range(row0, row1):
+                for col in range(col0, col1):
+                    p_idx = row * self.npw + col
+                    mm = self._get_patch_mmap(p_idx)
+                    coeffs_out[b, p_idx] = mm[indices[b]]
+                    visible_mask[b, p_idx] = True
+                    bytes_read = self.C * self.total_coeffs * 4
+                    self.bytes_read_epoch += bytes_read
+                    self.bytes_read_total += bytes_read
+
+        self.samples_read_epoch += B
+        coeffs_out = coeffs_out.reshape(B, self.P, self.C, self.bs_h, self.bs_w)
+        return torch.from_numpy(coeffs_out), visible_mask
+
+    @torch.no_grad()
+    def serve_indices(self, indices, crop_params: Optional[np.ndarray] = None):
+        """
+        Serve a batch of crop-aware images at full fidelity.
+
+        Returns:
+            x: (B, C, output_size, output_size) tensor on self.device
+            crop_params: (B, 4) integer crop parameters
+            visible_mask: (B, P) bool mask of patches touched by the crop
+        """
+        if torch.is_tensor(indices):
+            indices = indices.detach().cpu().numpy()
+        else:
+            indices = np.asarray(indices, dtype=np.int64)
+
+        if crop_params is None:
+            crop_params = self._sample_crop_params(indices)
+        else:
+            crop_params = np.asarray(crop_params, dtype=np.int64)
+
+        from .transforms import block_idct2d
+
+        coeffs, visible_mask = self._read_visible_patches(indices, crop_params)
+        coeffs = coeffs.to(self.device, non_blocking=True)
+        canvas = block_idct2d(coeffs, self.nph, self.npw)
+
+        crops = []
+        for b, (top, left, height, width) in enumerate(crop_params):
+            sample_h, sample_w = self.sample_shapes[indices[b]]
+            crop = canvas[
+                b:b + 1,
+                :,
+                int(top):min(int(top + height), int(sample_h)),
+                int(left):min(int(left + width), int(sample_w)),
+            ]
+            crop = TF.resize(
+                crop,
+                [self.output_size, self.output_size],
+                interpolation=TF.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            crops.append(crop)
+
+        x = torch.cat(crops, dim=0)
+        return x, crop_params, visible_mask
+
+    def get_io_ratio(self) -> float:
+        if self.bytes_read_epoch == 0 or self.samples_read_epoch == 0:
+            return 0.0
+        full_epoch_bytes = self.samples_read_epoch * self.bytes_per_sample_full
+        return self.bytes_read_epoch / full_epoch_bytes
