@@ -589,22 +589,24 @@ def train_process(index, args):
                     flush=True,
                 )
 
-            ckpt = {
-                "epoch": ep + 1,
-                "state_dict": model.state_dict(),
-                "optimizer": opt.state_dict(),
-                "scheduler": sched_lr.state_dict(),
-                "best_acc": best_acc,
-                "val_acc": va_acc,
-                "args": vars(args),
-            }
-            xm.save(ckpt, os.path.join(args.save_dir, "latest.pt"))
-            if (ep + 1) % args.save_every == 0:
-                xm.save(ckpt, os.path.join(args.save_dir, f"epoch_{ep+1:03d}.pt"))
-            if va_acc > best_acc:
-                best_acc = va_acc
-                ckpt["best_acc"] = best_acc
-                xm.save(ckpt, os.path.join(args.save_dir, "best.pt"))
+        # xm.save must be called by ALL processes (it is a collective op).
+        # Only the master ordinal actually writes to disk.
+        ckpt = {
+            "epoch": ep + 1,
+            "state_dict": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scheduler": sched_lr.state_dict(),
+            "best_acc": best_acc,
+            "val_acc": va_acc,
+            "args": vars(args),
+        }
+        xm.save(ckpt, os.path.join(args.save_dir, "latest.pt"))
+        if (ep + 1) % args.save_every == 0:
+            xm.save(ckpt, os.path.join(args.save_dir, f"epoch_{ep+1:03d}.pt"))
+        if va_acc > best_acc:
+            best_acc = va_acc
+            ckpt["best_acc"] = best_acc
+            xm.save(ckpt, os.path.join(args.save_dir, "best.pt"))
 
     xm.master_print(f"Training complete. Best val acc: {best_acc:.4f}")
 
