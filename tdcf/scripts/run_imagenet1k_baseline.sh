@@ -49,7 +49,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         --epochs 100 --base_lr 0.1 --lr_ref_batch 256 \
         --weight_decay 1e-4 --warmup_epochs 5 \
         --label_smooth 0.1 --grad_clip 1.0 \
-        --amp_bf16 --num_workers 8 \
+        --amp_bf16 --num_workers 32 \
         --skip_pilot \
         --save_dir "$SAVE_DIR" \
         $RESUME_FLAG \
