@@ -9,6 +9,8 @@
 set -euo pipefail
 
 export PJRT_DEVICE=TPU
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 
 TRAIN_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
 VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
@@ -47,7 +49,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         --epochs 100 --base_lr 0.1 --lr_ref_batch 256 \
         --weight_decay 1e-4 --warmup_epochs 5 \
         --label_smooth 0.1 --grad_clip 1.0 \
-        --amp_bf16 --num_workers 32 \
+        --amp_bf16 --num_workers 8 \
         --skip_pilot \
         --save_dir "$SAVE_DIR" \
         $RESUME_FLAG \
