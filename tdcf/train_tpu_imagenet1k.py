@@ -1,4 +1,5 @@
 import os
+import time
 import math
 import random
 import argparse
@@ -462,9 +463,17 @@ def train_process(index, args):
         model.train()
         tr_loss_s, tr_correct, tr_n = make_epoch_accumulators(device)
 
+        train_start_time = time.time()
+        step_start_time = time.time()
+
         for step, batch in enumerate(para_train):
             if step >= train_steps:
                 break
+            
+            if xm.is_master_ordinal() and step > 0 and step % 100 == 0:
+                elapsed = time.time() - step_start_time
+                print(f"  [Train] Epoch {ep} | Step {step:4d}/{train_steps} | Time for 100 steps: {elapsed:.2f}s")
+                step_start_time = time.time()
             images, labels = batch
             labels = labels.long()
             if args.skip_pilot:
@@ -505,12 +514,15 @@ def train_process(index, args):
         tr_loss_total = xm.mesh_reduce("tr_loss", tr_loss_s, sum)
         tr_acc = (tr_corr_total / tr_n_total).item()
         tr_loss = (tr_loss_total / tr_n_total).item()
+        train_time = time.time() - train_start_time
 
         # Validate at full fidelity
         pl_val = pl.ParallelLoader(val_loader, [device])
         para_val = pl_val.per_device_loader(device)
         model.eval()
         va_loss_s, va_correct, va_n = make_epoch_accumulators(device)
+        
+        val_start_time = time.time()
 
         with torch.no_grad():
             for step, batch in enumerate(para_val):
@@ -531,15 +543,16 @@ def train_process(index, args):
         va_loss_total = xm.mesh_reduce("va_loss", va_loss_s, sum)
         va_acc = (va_corr_total / va_n_total).item()
         va_loss = (va_loss_total / va_n_total).item()
+        val_time = time.time() - val_start_time
 
         sched_lr.step()
 
         if xm.is_master_ordinal():
             if args.skip_pilot:
                 print(
-                    f"E {ep+1:3d}/{args.epochs} | IO=1.000 (baseline) | "
-                    f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
-                    f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} | "
+                    f"E {ep:3d}/{args.epochs} | IO={io_ratio:.3f} (baseline) | "
+                    f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} ({train_time:.1f}s) | "
+                    f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} ({val_time:.1f}s) | "
                     f"LR={opt.param_groups[0]['lr']:.2e}",
                     flush=True,
                 )
@@ -553,9 +566,10 @@ def train_process(index, args):
                 )
             else:
                 print(
-                    f"E {ep+1:3d}/{args.epochs} | K_hi={K_high:2d} K_lo={args.k_low} q={q_e:3d} | "
-                    f"IO={io_ratio:.3f} | Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
-                    f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} | "
+                    f"E {ep:3d}/{args.epochs} | "
+                    f"Budget={budget}/{total_budget} | IO={io_ratio:.3f} | "
+                    f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} ({train_time:.1f}s) | "
+                    f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} ({val_time:.1f}s) | "
                     f"LR={opt.param_groups[0]['lr']:.2e}",
                     flush=True,
                 )
