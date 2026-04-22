@@ -149,40 +149,51 @@ def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
             T.RandomResizedCrop(args.img_size),
             T.RandomHorizontalFlip(),
             T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
     else:
         transform = T.Compose([
             T.Resize(int(args.img_size * 1.14)),
             T.CenterCrop(args.img_size),
             T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
 
+    dataset = wds.WebDataset(
+        shards_url,
+        resampled=is_training,
+        shardshuffle=is_training,
+        nodesplitter=wds.split_by_node,
+    )
+
+    if is_training:
+        dataset = dataset.compose(wds.split_by_worker).shuffle(5000)
+
     dataset = (
-        wds.WebDataset(
-            shards_url,
-            resampled=is_training,
-            shardshuffle=is_training,
-            nodesplitter=wds.split_by_node,
-        )
-        .compose(wds.split_by_worker)
-        .shuffle(5000 if is_training else 0)
+        dataset
         .decode("pil")
         .to_tuple("jpg;jpeg;png", "cls")
         .map_tuple(transform, identity_label)
-        .batched(batch_size, partial=not is_training)
     )
+
     if is_training:
-        dataset = dataset.with_epoch(math.ceil(args.train_samples / (batch_size * xm.xrt_world_size())))
+        dataset = dataset.batched(batch_size, partial=False)
+        dataset = dataset.with_epoch(
+            math.ceil(args.train_samples / (batch_size * xm.xrt_world_size()))
+        )
+        num_workers = args.num_workers
+    else:
+        # Deterministic validation: no split_by_worker, no shuffle, no host-side
+        # worker interleaving. Repeat is paired with a fixed step cap so every
+        # rank sees the same number of batches without deadlocking.
+        dataset = dataset.repeat().batched(batch_size, partial=False)
+        num_workers = 0
 
     return wds.WebLoader(
         dataset,
         batch_size=None,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=False,
         persistent_workers=False,
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
 
@@ -333,7 +344,7 @@ def train_process(index, args):
     num_patches = nph * npw
     total_budget = num_patches * args.num_bands
     train_steps = math.ceil(args.train_samples / global_bs)
-    val_steps = math.ceil(args.val_samples / (args.eval_batch_size * world_size))
+    val_steps = max(1, args.val_samples // (args.eval_batch_size * world_size))
     pilot_steps = max(1, int(train_steps * args.pilot_ratio))
 
     if xm.is_master_ordinal():
@@ -358,8 +369,6 @@ def train_process(index, args):
 
     train_loader = build_wds_loader(args.train_shards, args.batch_size, args, True)
     pilot_loader = build_wds_loader(args.train_shards, args.batch_size, args, True)
-    val_loader = build_wds_loader(args.val_shards, args.eval_batch_size, args, False)
-
     # Pilot
     if not args.skip_pilot:
         if xm.is_master_ordinal():
@@ -547,6 +556,7 @@ def train_process(index, args):
         train_time = time.time() - train_start_time
 
         # Validate at full fidelity
+        val_loader = build_wds_loader(args.val_shards, args.eval_batch_size, args, False)
         pl_val = pl.ParallelLoader(val_loader, [device])
         para_val = pl_val.per_device_loader(device)
         model.eval()
