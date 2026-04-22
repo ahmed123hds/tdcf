@@ -460,7 +460,7 @@ def train_process(index, args):
         pl_train = pl.ParallelLoader(train_loader, [device])
         para_train = pl_train.per_device_loader(device)
         model.train()
-        tr_loss_s, tr_correct, tr_n = make_epoch_accumulators(device)
+        tr_losses, tr_corrs, tr_ns = [], [], []
 
         train_start_time = time.time()
         step_start_time = time.time()
@@ -505,9 +505,9 @@ def train_process(index, args):
             xm.optimizer_step(opt)
 
             batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
-            tr_loss_s = tr_loss_s + (loss.detach() * batch_n)
-            tr_correct = tr_correct + (logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1)
-            tr_n = tr_n + batch_n
+            tr_losses.append(loss.detach() * batch_n)
+            tr_corrs.append((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
+            tr_ns.append(batch_n)
 
             if xm.is_master_ordinal():
                 if step == 0:
@@ -528,9 +528,9 @@ def train_process(index, args):
         del para_train
         pl_train.close()
 
-        tr_n_total = xm.all_reduce(xm.REDUCE_SUM, tr_n)
-        tr_corr_total = xm.all_reduce(xm.REDUCE_SUM, tr_correct)
-        tr_loss_total = xm.all_reduce(xm.REDUCE_SUM, tr_loss_s)
+        tr_n_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(tr_ns).sum())
+        tr_corr_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(tr_corrs).sum())
+        tr_loss_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(tr_losses).sum())
         tr_acc = (tr_corr_total / tr_n_total).item()
         tr_loss = (tr_loss_total / tr_n_total).item()
         train_time = time.time() - train_start_time
@@ -539,7 +539,7 @@ def train_process(index, args):
         pl_val = pl.ParallelLoader(val_loader, [device])
         para_val = pl_val.per_device_loader(device)
         model.eval()
-        va_loss_s, va_correct, va_n = make_epoch_accumulators(device)
+        va_losses, va_corrs, va_ns = [], [], []
         
         val_start_time = time.time()
 
@@ -553,17 +553,17 @@ def train_process(index, args):
                     logits = model(images)
                     loss = criterion(logits, labels)
                 batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
-                va_loss_s = va_loss_s + (loss * batch_n)
-                va_correct = va_correct + (logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1)
-                va_n = va_n + batch_n
+                va_losses.append(loss * batch_n)
+                va_corrs.append((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
+                va_ns.append(batch_n)
 
         # Close the validation ParallelLoader to release background threads
         del para_val
         pl_val.close()
 
-        va_n_total = xm.all_reduce(xm.REDUCE_SUM, va_n)
-        va_corr_total = xm.all_reduce(xm.REDUCE_SUM, va_correct)
-        va_loss_total = xm.all_reduce(xm.REDUCE_SUM, va_loss_s)
+        va_n_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(va_ns).sum())
+        va_corr_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(va_corrs).sum())
+        va_loss_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(va_losses).sum())
         va_acc = (va_corr_total / va_n_total).item()
         va_loss = (va_loss_total / va_n_total).item()
         val_time = time.time() - val_start_time
