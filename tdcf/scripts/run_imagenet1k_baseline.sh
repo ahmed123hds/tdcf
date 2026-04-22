@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+export XLA_USE_BF16=1
+export PJRT_DEVICE=TPU
+
 TRAIN_SHARDS='/home/filliones/streaming_dataset/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
 VAL_SHARDS='/home/filliones/streaming_dataset/imagenet_hf/imagenet1k-validation-{00..63}.tar'
 SAVE_DIR='./results/imagenet1k_baseline_full'
