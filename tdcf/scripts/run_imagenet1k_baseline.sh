@@ -41,11 +41,11 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         --backbone resnet50 \
         --img_size 224 --block_size 16 --num_bands 16 \
         --n_classes 1000 \
-        --batch_size 64 --eval_batch_size 64 \
+        --batch_size 128 --eval_batch_size 128 \
         --epochs 100 --base_lr 0.1 --lr_ref_batch 256 \
         --weight_decay 1e-4 --warmup_epochs 5 \
         --label_smooth 0.1 --grad_clip 1.0 \
-        --amp_bf16 --num_workers 16 \
+        --amp_bf16 --num_workers 4 \
         --skip_pilot \
         --save_dir "$SAVE_DIR" \
         $RESUME_FLAG \
