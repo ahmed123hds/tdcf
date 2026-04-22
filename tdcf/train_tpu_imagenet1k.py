@@ -475,12 +475,6 @@ def train_process(index, args):
 
             if step >= train_steps:
                 break
-            
-            if xm.is_master_ordinal() and step > 0 and step % 10 == 0:
-                elapsed = time.time() - step_start_time
-                imgs_sec = (10 * global_bs) / elapsed
-                print(f"  [Train] Epoch {ep} | Step {step:4d}/{train_steps} | Time for 10 steps: {elapsed:.2f}s | {imgs_sec:.1f} imgs/sec", flush=True)
-                step_start_time = time.time()
             images, labels = batch
             labels = labels.long()
             if args.skip_pilot:
@@ -515,6 +509,21 @@ def train_process(index, args):
             tr_loss_s += loss.detach() * batch_n
             tr_correct += (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
             tr_n += batch_n
+
+            if xm.is_master_ordinal():
+                if step == 0:
+                    elapsed = time.time() - step_start_time
+                    imgs_sec = global_bs / elapsed
+                    # Force XLA sync to get real-time metrics for Step 0
+                    step_loss = loss.item()
+                    step_acc = (logits.argmax(1) == labels).float().mean().item()
+                    print(f"  [Train] Epoch {ep} | Step {step:4d}/{train_steps} | Time: {elapsed:.2f}s | {imgs_sec:.1f} imgs/sec | Loss: {step_loss:.4f} | Acc: {step_acc:.4f}", flush=True)
+                    step_start_time = time.time()
+                elif step % 100 == 0:
+                    elapsed = time.time() - step_start_time
+                    imgs_sec = (100 * global_bs) / elapsed
+                    print(f"  [Train] Epoch {ep} | Step {step:4d}/{train_steps} | Time for 100 steps: {elapsed:.2f}s | {imgs_sec:.1f} imgs/sec", flush=True)
+                    step_start_time = time.time()
 
         tr_n_total = xm.mesh_reduce("tr_n", tr_n, sum)
         tr_corr_total = xm.mesh_reduce("tr_corr", tr_correct, sum)
