@@ -467,6 +467,12 @@ def train_process(index, args):
         step_start_time = time.time()
 
         for step, batch in enumerate(para_train):
+            if step == 0 and xm.is_master_ordinal():
+                print("  -> Got first batch from DataLoader! Building XLA graph...", flush=True)
+
+            if step == 1 and xm.is_master_ordinal():
+                print("  -> Step 1 complete! XLA graph compilation successful.", flush=True)
+
             if step >= train_steps:
                 break
             
