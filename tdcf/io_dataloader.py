@@ -30,7 +30,7 @@ from typing import Optional
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
-from .transforms import idct2d
+from .transforms import idct2d, block_idct2d
 
 
 class BandShardedStore:
@@ -800,9 +800,10 @@ class CropAwareBlockBandStore:
     store can sample a crop window, read only the overlapping patches, then
     reconstruct the cropped region and resize it to the model's input size.
 
-    This is the physical-I/O substrate for a future ImageNet-1K store-backed
-    trainer. Phase 1 supports full-fidelity crop-aware serving and exact patch
-    byte accounting. Budgeted partial-band serving can be layered on top.
+    This is the physical-I/O substrate for a store-backed ImageNet-1K trainer.
+    It supports both full-fidelity serving and TDCF-style sample-adaptive
+    partial-band reads inside the crop window with exact coefficient byte
+    accounting.
     """
 
     def __init__(
@@ -850,6 +851,14 @@ class CropAwareBlockBandStore:
 
         self._patch_mmaps = [None] * self.P
 
+        self.K_high = self.num_bands
+        self.K_low = 1
+        self.q = self.P
+        self.patch_sensitivity = np.ones(self.P, dtype=np.float32) / self.P
+        self.band_sensitivity = np.ones(self.num_bands, dtype=np.float32) / self.num_bands
+        self.patch_policy = "gradient"
+        self.budget_bands = self.P * self.num_bands
+
         self.bytes_read_epoch = 0
         self.bytes_read_total = 0
         self.samples_read_epoch = 0
@@ -865,6 +874,37 @@ class CropAwareBlockBandStore:
     def reset_epoch_io(self):
         self.bytes_read_epoch = 0
         self.samples_read_epoch = 0
+
+    def set_fidelity(self, K_high: int, K_low: int, q: int,
+                     patch_sensitivity: np.ndarray = None,
+                     band_sensitivity: np.ndarray = None,
+                     patch_policy: str = "gradient"):
+        self.K_high = min(K_high, self.num_bands)
+        self.K_low = min(K_low, self.num_bands)
+        self.q = min(q, self.P)
+        self.patch_policy = patch_policy
+        self.budget_bands = self.q * self.K_high + (self.P - self.q) * self.K_low
+
+        if patch_sensitivity is not None:
+            self.patch_sensitivity = np.asarray(patch_sensitivity, dtype=np.float32).copy()
+        if band_sensitivity is not None:
+            self.band_sensitivity = np.asarray(band_sensitivity, dtype=np.float32).copy()
+
+    def set_budget(self, total_bands: int,
+                   patch_sensitivity: np.ndarray = None,
+                   band_sensitivity: np.ndarray = None,
+                   k_low: int = 1,
+                   patch_policy: str = "greedy"):
+        self.budget_bands = max(self.P * k_low, min(total_bands, self.P * self.num_bands))
+        self.K_low = min(k_low, self.num_bands)
+        self.patch_policy = patch_policy
+        self.K_high = self.num_bands
+        self.q = self.P
+
+        if patch_sensitivity is not None:
+            self.patch_sensitivity = np.asarray(patch_sensitivity, dtype=np.float32).copy()
+        if band_sensitivity is not None:
+            self.band_sensitivity = np.asarray(band_sensitivity, dtype=np.float32).copy()
 
     def get_dataset(self):
         return BlockBandDataset(self)
@@ -892,6 +932,17 @@ class CropAwareBlockBandStore:
             params[row] = (top, left, height, width)
         return params
 
+    def _center_crop_params(self, indices: np.ndarray):
+        params = np.zeros((len(indices), 4), dtype=np.int64)
+        for row, idx in enumerate(indices):
+            h, w = self.sample_shapes[idx]
+            top = max((int(h) - self.output_size) // 2, 0)
+            left = max((int(w) - self.output_size) // 2, 0)
+            height = min(self.output_size, int(h))
+            width = min(self.output_size, int(w))
+            params[row] = (top, left, height, width)
+        return params
+
     def _patch_bbox_from_crop(self, top: int, left: int, height: int, width: int):
         row0 = max(0, top // self.bs_h)
         col0 = max(0, left // self.bs_w)
@@ -899,54 +950,156 @@ class CropAwareBlockBandStore:
         col1 = min(self.npw, math.ceil((left + width) / self.bs_w))
         return row0, row1, col0, col1
 
-    def _read_visible_patches(self, indices: np.ndarray, crop_params: np.ndarray):
-        B = len(indices)
-        coeffs_out = np.zeros(
-            (B, self.P, self.C, self.total_coeffs), dtype=np.float32
-        )
+    def _build_visible_mask(self, crop_params: np.ndarray):
+        B = len(crop_params)
         visible_mask = np.zeros((B, self.P), dtype=bool)
-
         for b, (top, left, height, width) in enumerate(crop_params):
             row0, row1, col0, col1 = self._patch_bbox_from_crop(
                 int(top), int(left), int(height), int(width)
             )
             for row in range(row0, row1):
-                for col in range(col0, col1):
-                    p_idx = row * self.npw + col
-                    mm = self._get_patch_mmap(p_idx)
-                    coeffs_out[b, p_idx] = mm[indices[b]]
-                    visible_mask[b, p_idx] = True
-                    bytes_read = self.C * self.total_coeffs * 4
-                    self.bytes_read_epoch += bytes_read
-                    self.bytes_read_total += bytes_read
+                start = row * self.npw + col0
+                end = row * self.npw + col1
+                visible_mask[b, start:end] = True
+        return visible_mask
+
+    def _compute_importance_mask(self, indices: np.ndarray, visible_mask: np.ndarray) -> np.ndarray:
+        B = len(indices)
+        important = np.zeros((B, self.P), dtype=bool)
+
+        for b in range(B):
+            visible_ids = np.flatnonzero(visible_mask[b])
+            V = len(visible_ids)
+            if V == 0:
+                continue
+            q_vis = int(round(self.q * V / max(self.P, 1)))
+            q_vis = max(0, min(V, q_vis))
+            if q_vis == 0:
+                continue
+            if q_vis >= V:
+                important[b, visible_ids] = True
+                continue
+
+            if self.patch_policy == "random":
+                scores = np.random.rand(V).astype(np.float32)
+            elif self.patch_policy == "static":
+                scores = self.patch_sensitivity[visible_ids]
+            else:
+                scores = self.patch_sensitivity[visible_ids] * self.patch_signal[indices[b], visible_ids]
+
+            top_local = np.argpartition(-scores, q_vis - 1)[:q_vis]
+            important[b, visible_ids[top_local]] = True
+
+        return important
+
+    def _compute_k_allocation(self, indices: np.ndarray, visible_mask: np.ndarray) -> np.ndarray:
+        B = len(indices)
+        k_alloc = np.zeros((B, self.P), dtype=np.int32)
+
+        if self.patch_policy == "greedy":
+            max_extra = self.num_bands - self.K_low
+            bs_sq = self.band_sensitivity[self.K_low:] ** 2
+            for b in range(B):
+                visible_ids = np.flatnonzero(visible_mask[b])
+                V = len(visible_ids)
+                if V == 0:
+                    continue
+
+                target_budget = int(round(self.budget_bands * V / max(self.P, 1)))
+                target_budget = max(V * self.K_low, min(V * self.num_bands, target_budget))
+                k_alloc[b, visible_ids] = self.K_low
+
+                extra_total = target_budget - V * self.K_low
+                if extra_total <= 0 or max_extra <= 0:
+                    continue
+
+                sig_sq = self.patch_signal[indices[b], visible_ids].astype(np.float32) ** 2
+                marginals = sig_sq[:, np.newaxis] * bs_sq[np.newaxis, :]
+                flat = marginals.reshape(-1)
+                extra_total = min(extra_total, flat.size)
+                if extra_total <= 0:
+                    continue
+
+                top_idx = np.argpartition(-flat, extra_total - 1)[:extra_total]
+                patch_local = top_idx // max_extra
+                np.add.at(k_alloc[b], visible_ids[patch_local], 1)
+
+            np.clip(k_alloc, 0, self.num_bands, out=k_alloc)
+            return k_alloc
+
+        important = self._compute_importance_mask(indices, visible_mask)
+        k_alloc = np.where(important, self.K_high, self.K_low).astype(np.int32)
+        k_alloc[~visible_mask] = 0
+        return k_alloc
+
+    def _read_visible_patches(
+        self,
+        indices: np.ndarray,
+        crop_params: np.ndarray,
+        k_alloc: Optional[np.ndarray] = None,
+    ):
+        B = len(indices)
+        coeffs_out = np.zeros(
+            (B, self.P, self.C, self.total_coeffs), dtype=np.float32
+        )
+        visible_mask = self._build_visible_mask(crop_params)
+        if k_alloc is None:
+            k_alloc = np.where(visible_mask, self.num_bands, 0).astype(np.int32)
+
+        for p_idx in range(self.P):
+            rows_all = np.where(visible_mask[:, p_idx])[0]
+            if len(rows_all) == 0:
+                continue
+
+            mm = self._get_patch_mmap(p_idx)
+            k_values = np.unique(k_alloc[rows_all, p_idx])
+            for k_val in k_values:
+                if k_val <= 0:
+                    continue
+                rows = rows_all[k_alloc[rows_all, p_idx] == k_val]
+                n_coeffs = int(k_val) * self.band_size
+                zz_k = self.zz[:n_coeffs]
+                data = mm[indices[rows], :, :n_coeffs]
+                target = np.zeros((len(rows), self.C, self.total_coeffs), dtype=np.float32)
+                target[:, :, zz_k] = data
+                coeffs_out[rows, p_idx] = target
+                bytes_read = int(len(rows) * self.C * n_coeffs * 4)
+                self.bytes_read_epoch += bytes_read
+                self.bytes_read_total += bytes_read
 
         self.samples_read_epoch += B
         coeffs_out = coeffs_out.reshape(B, self.P, self.C, self.bs_h, self.bs_w)
         return torch.from_numpy(coeffs_out), visible_mask
 
     @torch.no_grad()
-    def serve_indices(self, indices, crop_params: Optional[np.ndarray] = None):
-        """
-        Serve a batch of crop-aware images at full fidelity.
-
-        Returns:
-            x: (B, C, output_size, output_size) tensor on self.device
-            crop_params: (B, 4) integer crop parameters
-            visible_mask: (B, P) bool mask of patches touched by the crop
-        """
+    def read_coeffs(self, indices, crop_params: Optional[np.ndarray] = None,
+                    deterministic_val: bool = False):
         if torch.is_tensor(indices):
             indices = indices.detach().cpu().numpy()
         else:
             indices = np.asarray(indices, dtype=np.int64)
 
         if crop_params is None:
-            crop_params = self._sample_crop_params(indices)
+            crop_params = (
+                self._center_crop_params(indices)
+                if deterministic_val
+                else self._sample_crop_params(indices)
+            )
         else:
             crop_params = np.asarray(crop_params, dtype=np.int64)
 
-        from .transforms import block_idct2d
+        visible_mask = self._build_visible_mask(crop_params)
+        k_alloc = self._compute_k_allocation(indices, visible_mask)
+        coeffs, visible_mask = self._read_visible_patches(indices, crop_params, k_alloc=k_alloc)
+        return coeffs, crop_params, visible_mask, k_alloc
 
-        coeffs, visible_mask = self._read_visible_patches(indices, crop_params)
+    @torch.no_grad()
+    def reconstruct_crops(self, coeffs: torch.Tensor, indices, crop_params: np.ndarray):
+        if torch.is_tensor(indices):
+            indices = indices.detach().cpu().numpy()
+        else:
+            indices = np.asarray(indices, dtype=np.int64)
+
         coeffs = coeffs.to(self.device, non_blocking=True)
         canvas = block_idct2d(coeffs, self.nph, self.npw)
 
@@ -967,8 +1120,24 @@ class CropAwareBlockBandStore:
             )
             crops.append(crop)
 
-        x = torch.cat(crops, dim=0)
-        return x, crop_params, visible_mask
+        return torch.cat(crops, dim=0)
+
+    @torch.no_grad()
+    def serve_indices(self, indices, crop_params: Optional[np.ndarray] = None,
+                     deterministic_val: bool = False):
+        """
+        Serve a batch of crop-aware images using the current fidelity state.
+
+        Returns:
+            x: (B, C, output_size, output_size) tensor on self.device
+            crop_params: (B, 4) integer crop parameters
+            visible_mask: (B, P) bool mask of patches touched by the crop
+        """
+        coeffs, crop_params, visible_mask, k_alloc = self.read_coeffs(
+            indices, crop_params=crop_params, deterministic_val=deterministic_val
+        )
+        x = self.reconstruct_crops(coeffs, indices, crop_params)
+        return x, crop_params, visible_mask, k_alloc
 
     def get_io_ratio(self) -> float:
         if self.bytes_read_epoch == 0 or self.samples_read_epoch == 0:
