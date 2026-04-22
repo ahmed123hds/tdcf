@@ -29,6 +29,8 @@ os.environ.setdefault("XLA_USE_BF16", "1")
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+_FLAT_POS_CACHE = {}
+_BAND_CUTOFF_CACHE = {}
 
 
 class InputNormalize(nn.Module):
@@ -205,6 +207,65 @@ def make_epoch_accumulators(device: torch.device):
     )
 
 
+def _get_flat_pos(total_coeffs: int, device: torch.device) -> torch.Tensor:
+    key = (total_coeffs, device)
+    pos = _FLAT_POS_CACHE.get(key)
+    if pos is None:
+        pos = torch.arange(
+            total_coeffs, device=device, dtype=torch.long
+        ).view(1, 1, 1, total_coeffs)
+        _FLAT_POS_CACHE[key] = pos
+    return pos
+
+
+def _get_band_cutoff_lut(num_bands: int, band_size: int, device: torch.device) -> torch.Tensor:
+    key = (num_bands, band_size, device)
+    lut = _BAND_CUTOFF_CACHE.get(key)
+    if lut is None:
+        lut = torch.arange(
+            num_bands + 1, device=device, dtype=torch.long
+        ) * band_size
+        _BAND_CUTOFF_CACHE[key] = lut
+    return lut
+
+
+def _to_device_tensor(value, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if torch.is_tensor(value):
+        if value.device == device and value.dtype == dtype:
+            return value
+        return value.to(device=device, dtype=dtype)
+    return torch.as_tensor(value, device=device, dtype=dtype)
+
+
+def _kth_threshold(flat_scores: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    Return the kth-largest score threshold using a full static-shape sort.
+
+    This avoids changing the `topk(k=...)` operator shape across epochs in
+    budget mode, which can trigger extra XLA graph variants when the budget
+    schedule changes.
+    """
+    B, N = flat_scores.shape
+    if k <= 0:
+        return torch.full(
+            (B, 1),
+            torch.finfo(flat_scores.dtype).max,
+            device=flat_scores.device,
+            dtype=flat_scores.dtype,
+        )
+    if k >= N:
+        return torch.full(
+            (B, 1),
+            torch.finfo(flat_scores.dtype).min,
+            device=flat_scores.device,
+            dtype=flat_scores.dtype,
+        )
+
+    sorted_scores, _ = torch.sort(flat_scores, dim=1, descending=True)
+    kth_idx = torch.full((B, 1), k - 1, device=flat_scores.device, dtype=torch.long)
+    return torch.gather(sorted_scores, 1, kth_idx)
+
+
 def _topk_mask(scores: torch.Tensor, q: int) -> torch.Tensor:
     B, P = scores.shape
     if q >= P:
@@ -236,10 +297,10 @@ def compute_k_allocation(
     device = coeffs.device
 
     patch_signal = coeffs.detach().abs().mean(dim=(2, 3, 4))  # (B, P)
-    patch_weights = torch.as_tensor(
+    patch_weights = _to_device_tensor(
         patch_sensitivity, device=device, dtype=patch_signal.dtype
     )
-    band_weights = torch.as_tensor(
+    band_weights = _to_device_tensor(
         band_sensitivity, device=device, dtype=patch_signal.dtype
     )
     utility = patch_signal * patch_weights.unsqueeze(0)  # (B, P)
@@ -258,10 +319,11 @@ def compute_k_allocation(
         bs_extra = band_weights[int(k_low):]       # (extra_bands,)
         # (B, P, extra_bands)
         scores_3d = utility.unsqueeze(-1) * bs_extra.view(1, 1, -1)
-        # Flatten to (B, P*extra_bands), find threshold via topk
+        # Flatten to (B, P*extra_bands), find threshold with a full static-shape
+        # sort to reduce per-epoch graph churn from dynamic topk(k=...).
         flat = scores_3d.reshape(B, P * extra_bands)
         k_budget = min(int(extra_total), P * extra_bands)
-        threshold = torch.topk(flat, k=k_budget, dim=1, largest=True, sorted=True).values[:, -1:]  # (B, 1)
+        threshold = _kth_threshold(flat, k_budget)
         # Each patch gets the number of extra bands whose score > threshold
         band_granted = (scores_3d > threshold.unsqueeze(-1)).sum(dim=-1)  # (B, P)
         k_alloc = (int(k_low) + band_granted).clamp(int(k_low), int(num_bands))
@@ -305,10 +367,13 @@ def apply_k_allocation(
     total_coeffs = bs_h * bs_w
     band_size = total_coeffs // num_bands
 
-    # pos: (1, 1, 1, total_coeffs),  cutoff: (B, P, 1, 1)
-    # mask: (B, P, 1, total_coeffs) broadcasts over C dimension
-    pos = torch.arange(total_coeffs, device=coeffs.device, dtype=torch.long).view(1, 1, 1, total_coeffs)
-    cutoff = (k_alloc * band_size).view(B, P, 1, 1)  # (B, P, 1, 1)
+    # pos: (1, 1, 1, total_coeffs), cutoff: (B, P, 1, 1)
+    # mask: (B, P, 1, total_coeffs) broadcasts over C dimension.
+    # Cache both the flat positions and the band-cutoff lookup to avoid
+    # recreating constant tensors every batch.
+    pos = _get_flat_pos(total_coeffs, coeffs.device)
+    cutoff_lut = _get_band_cutoff_lut(num_bands, band_size, coeffs.device)
+    cutoff = cutoff_lut.index_select(0, k_alloc.reshape(-1)).view(B, P, 1, 1)
     mask = (pos < cutoff)  # (B, P, 1, total_coeffs) — broadcasts over C
 
     coeffs_flat = coeffs.reshape(B, P, C, total_coeffs)
@@ -446,11 +511,16 @@ def train_process(index, args):
             print(f"[RESUME] No checkpoint found at {ckpt_path}, starting from scratch.")
 
     for ep in range(start_epoch, args.epochs):
+        ps_t = None
+        bs_t = None
         if not args.skip_pilot:
             ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
             bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
             ps = estimator.patch_sensitivity_history[ps_idx]
             bs = estimator.band_sensitivity_history[bs_idx]
+            # Materialize policy tensors once per epoch instead of once per batch.
+            ps_t = torch.as_tensor(ps, device=device, dtype=torch.float32)
+            bs_t = torch.as_tensor(bs, device=device, dtype=torch.float32)
 
         if args.skip_pilot:
             budget = total_budget
@@ -495,12 +565,12 @@ def train_process(index, args):
                 coeffs = block_dct2d(images, block_size=args.block_size)
                 if args.budget_mode:
                     k_alloc = compute_k_allocation(
-                        coeffs, ps, bs, args.num_bands, args.k_low,
+                        coeffs, ps_t, bs_t, args.num_bands, args.k_low,
                         patch_policy="greedy", budget_bands=budget
                     )
                 else:
                     k_alloc = compute_k_allocation(
-                        coeffs, ps, bs, args.num_bands, args.k_low,
+                        coeffs, ps_t, bs_t, args.num_bands, args.k_low,
                         patch_policy=args.patch_policy, K_high=K_high, q=q_e
                     )
                 coeffs_masked = apply_k_allocation(coeffs, k_alloc, args.num_bands)
