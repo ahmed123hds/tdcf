@@ -460,7 +460,12 @@ def train_process(index, args):
         pl_train = pl.ParallelLoader(train_loader, [device])
         para_train = pl_train.per_device_loader(device)
         model.train()
-        tr_losses, tr_corrs, tr_ns = [], [], []
+        tr_loss_s, tr_correct, tr_n = 0.0, 0.0, 0.0
+        def update_tr_metrics(l_val, c_val, n_val):
+            nonlocal tr_loss_s, tr_correct, tr_n
+            tr_loss_s += l_val.item() * n_val
+            tr_correct += c_val.item()
+            tr_n += n_val
 
         train_start_time = time.time()
         step_start_time = time.time()
@@ -504,10 +509,10 @@ def train_process(index, args):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             xm.optimizer_step(opt)
 
-            batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
-            tr_losses.append(loss.detach() * batch_n)
-            tr_corrs.append((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
-            tr_ns.append(batch_n)
+            l_t = loss.detach()
+            c_t = (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
+            n_val = labels.size(0)
+            xm.add_step_closure(update_tr_metrics, args=(l_t, c_t, n_val))
 
             if xm.is_master_ordinal():
                 if step == 0:
@@ -528,18 +533,23 @@ def train_process(index, args):
         del para_train
         pl_train.close()
 
-        tr_n_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(tr_ns).sum())
-        tr_corr_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(tr_corrs).sum())
-        tr_loss_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(tr_losses).sum())
-        tr_acc = (tr_corr_total / tr_n_total).item()
-        tr_loss = (tr_loss_total / tr_n_total).item()
+        tr_n_total = xm.mesh_reduce(f"tr_n_{ep}", tr_n, sum)
+        tr_corr_total = xm.mesh_reduce(f"tr_corr_{ep}", tr_correct, sum)
+        tr_loss_total = xm.mesh_reduce(f"tr_loss_{ep}", tr_loss_s, sum)
+        tr_acc = tr_corr_total / tr_n_total if tr_n_total > 0 else 0.0
+        tr_loss = tr_loss_total / tr_n_total if tr_n_total > 0 else 0.0
         train_time = time.time() - train_start_time
 
         # Validate at full fidelity
         pl_val = pl.ParallelLoader(val_loader, [device])
         para_val = pl_val.per_device_loader(device)
         model.eval()
-        va_losses, va_corrs, va_ns = [], [], []
+        va_loss_s, va_correct, va_n = 0.0, 0.0, 0.0
+        def update_va_metrics(l_val, c_val, n_val):
+            nonlocal va_loss_s, va_correct, va_n
+            va_loss_s += l_val.item() * n_val
+            va_correct += c_val.item()
+            va_n += n_val
         
         val_start_time = time.time()
 
@@ -552,20 +562,21 @@ def train_process(index, args):
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(images)
                     loss = criterion(logits, labels)
-                batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
-                va_losses.append(loss * batch_n)
-                va_corrs.append((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
-                va_ns.append(batch_n)
+                l_t = loss.detach()
+                c_t = (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
+                n_val = labels.size(0)
+                xm.add_step_closure(update_va_metrics, args=(l_t, c_t, n_val))
+                xm.mark_step()
 
         # Close the validation ParallelLoader to release background threads
         del para_val
         pl_val.close()
 
-        va_n_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(va_ns).sum())
-        va_corr_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(va_corrs).sum())
-        va_loss_total = xm.all_reduce(xm.REDUCE_SUM, torch.stack(va_losses).sum())
-        va_acc = (va_corr_total / va_n_total).item()
-        va_loss = (va_loss_total / va_n_total).item()
+        va_n_total = xm.mesh_reduce(f"va_n_{ep}", va_n, sum)
+        va_corr_total = xm.mesh_reduce(f"va_corr_{ep}", va_correct, sum)
+        va_loss_total = xm.mesh_reduce(f"va_loss_{ep}", va_loss_s, sum)
+        va_acc = va_corr_total / va_n_total if va_n_total > 0 else 0.0
+        va_loss = va_loss_total / va_n_total if va_n_total > 0 else 0.0
         val_time = time.time() - val_start_time
 
         sched_lr.step()
