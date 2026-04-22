@@ -181,8 +181,8 @@ def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
         dataset,
         batch_size=None,
         num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False,
+        pin_memory=False,
+        persistent_workers=False,
         prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
