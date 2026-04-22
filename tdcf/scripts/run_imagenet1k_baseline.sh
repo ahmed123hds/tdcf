@@ -10,8 +10,8 @@ set -euo pipefail
 
 export PJRT_DEVICE=TPU
 
-TRAIN_SHARDS='pipe:gsutil cat gs://muhammad-iclr-datasets-usc2/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
-VAL_SHARDS='pipe:gsutil cat gs://muhammad-iclr-datasets-usc2/imagenet_hf/imagenet1k-validation-{00..63}.tar'
+TRAIN_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
+VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
 SAVE_DIR='./results/imagenet1k_baseline_full'
 MAX_RETRIES=20   # Maximum number of preemption restarts
 RETRY_WAIT=30    # Seconds to wait before restarting after a preemption
