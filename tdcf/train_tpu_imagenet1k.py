@@ -467,12 +467,11 @@ def train_process(index, args):
                 break
             images, labels = batch
             labels = labels.long()
-            coeffs = block_dct2d(images, block_size=args.block_size)
-
             if args.skip_pilot:
-                # Bypass masking entirely for baseline
-                x = block_idct2d(coeffs, nph, npw)
+                # Bypass masking and DCT entirely for baseline
+                x = images
             else:
+                coeffs = block_dct2d(images, block_size=args.block_size)
                 if args.budget_mode:
                     k_alloc = compute_k_allocation(
                         coeffs, ps, bs, args.num_bands, args.k_low,
