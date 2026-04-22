@@ -10,8 +10,8 @@ set -euo pipefail
 
 export PJRT_DEVICE=TPU
 
-TRAIN_SHARDS='/home/filliones/streaming_dataset/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
-VAL_SHARDS='/home/filliones/streaming_dataset/imagenet_hf/imagenet1k-validation-{00..63}.tar'
+TRAIN_SHARDS='pipe:gsutil cat gs://muhammad-iclr-datasets-usc2/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
+VAL_SHARDS='pipe:gsutil cat gs://muhammad-iclr-datasets-usc2/imagenet_hf/imagenet1k-validation-{00..63}.tar'
 SAVE_DIR='./results/imagenet1k_baseline_full'
 MAX_RETRIES=20   # Maximum number of preemption restarts
 RETRY_WAIT=30    # Seconds to wait before restarting after a preemption
@@ -47,7 +47,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         --epochs 100 --base_lr 0.1 --lr_ref_batch 256 \
         --weight_decay 1e-4 --warmup_epochs 5 \
         --label_smooth 0.1 --grad_clip 1.0 \
-        --amp_bf16 --num_workers 4 \
+        --amp_bf16 --num_workers 32 \
         --skip_pilot \
         --save_dir "$SAVE_DIR" \
         $RESUME_FLAG \
