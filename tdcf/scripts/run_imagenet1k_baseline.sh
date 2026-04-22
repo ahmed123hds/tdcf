@@ -8,6 +8,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${PACKAGE_ROOT}/.." && pwd)"
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
 export PJRT_DEVICE=TPU
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
