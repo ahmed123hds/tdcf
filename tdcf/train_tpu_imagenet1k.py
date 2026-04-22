@@ -504,7 +504,7 @@ def train_process(index, args):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             xm.optimizer_step(opt)
 
-            batch_n = labels.new_tensor(labels.size(0), dtype=torch.float32)
+            batch_n = torch.tensor(labels.size(0), device=device, dtype=torch.float32)
             tr_loss_s += loss.detach() * batch_n
             tr_correct += (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
             tr_n += batch_n
@@ -528,9 +528,9 @@ def train_process(index, args):
         del para_train
         pl_train.close()
 
-        tr_n_total = xm.mesh_reduce("tr_n", tr_n, sum)
-        tr_corr_total = xm.mesh_reduce("tr_corr", tr_correct, sum)
-        tr_loss_total = xm.mesh_reduce("tr_loss", tr_loss_s, sum)
+        tr_n_total = xm.all_reduce(xm.REDUCE_SUM, tr_n)
+        tr_corr_total = xm.all_reduce(xm.REDUCE_SUM, tr_correct)
+        tr_loss_total = xm.all_reduce(xm.REDUCE_SUM, tr_loss_s)
         tr_acc = (tr_corr_total / tr_n_total).item()
         tr_loss = (tr_loss_total / tr_n_total).item()
         train_time = time.time() - train_start_time
@@ -552,7 +552,7 @@ def train_process(index, args):
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(images)
                     loss = criterion(logits, labels)
-                batch_n = labels.new_tensor(labels.size(0), dtype=torch.float32)
+                batch_n = torch.tensor(labels.size(0), device=device, dtype=torch.float32)
                 va_loss_s += loss * batch_n
                 va_correct += (logits.argmax(1) == labels).sum().to(dtype=torch.float32)
                 va_n += batch_n
@@ -561,9 +561,9 @@ def train_process(index, args):
         del para_val
         pl_val.close()
 
-        va_n_total = xm.mesh_reduce("va_n", va_n, sum)
-        va_corr_total = xm.mesh_reduce("va_corr", va_correct, sum)
-        va_loss_total = xm.mesh_reduce("va_loss", va_loss_s, sum)
+        va_n_total = xm.all_reduce(xm.REDUCE_SUM, va_n)
+        va_corr_total = xm.all_reduce(xm.REDUCE_SUM, va_correct)
+        va_loss_total = xm.all_reduce(xm.REDUCE_SUM, va_loss_s)
         va_acc = (va_corr_total / va_n_total).item()
         va_loss = (va_loss_total / va_n_total).item()
         val_time = time.time() - val_start_time
