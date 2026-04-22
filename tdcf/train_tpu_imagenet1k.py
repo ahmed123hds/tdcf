@@ -476,10 +476,10 @@ def train_process(index, args):
             if step >= train_steps:
                 break
             
-            if xm.is_master_ordinal() and step > 0 and step % 100 == 0:
+            if xm.is_master_ordinal() and step > 0 and step % 10 == 0:
                 elapsed = time.time() - step_start_time
-                imgs_sec = (100 * global_bs) / elapsed
-                print(f"  [Train] Epoch {ep} | Step {step:4d}/{train_steps} | Time for 100 steps: {elapsed:.2f}s | {imgs_sec:.1f} imgs/sec")
+                imgs_sec = (10 * global_bs) / elapsed
+                print(f"  [Train] Epoch {ep} | Step {step:4d}/{train_steps} | Time for 10 steps: {elapsed:.2f}s | {imgs_sec:.1f} imgs/sec", flush=True)
                 step_start_time = time.time()
             images, labels = batch
             labels = labels.long()
