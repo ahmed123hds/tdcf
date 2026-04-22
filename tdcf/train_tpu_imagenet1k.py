@@ -10,8 +10,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.models as tv_models
-import torchvision.transforms as T
+import torchvision.transforms.v2 as T
 import webdataset as wds
+import torch_xla.distributed.xla_backend
 
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
@@ -145,19 +146,18 @@ def identity_label(label):
 def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
     if is_training:
         transform = T.Compose([
-            T.RandomResizedCrop(
-                args.img_size, scale=(0.08, 1.0), interpolation=T.InterpolationMode.BICUBIC
-            ),
+            T.RandomResizedCrop(args.img_size),
             T.RandomHorizontalFlip(),
             T.RandAugment(num_ops=2, magnitude=9),
-            T.ColorJitter(0.4, 0.4, 0.4),
-            T.ToTensor(),
+            T.ToDtype(torch.float32, scale=True),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
     else:
         transform = T.Compose([
-            T.Resize(int(args.img_size * 1.14), interpolation=T.InterpolationMode.BICUBIC),
+            T.Resize(int(args.img_size * 1.14)),
             T.CenterCrop(args.img_size),
-            T.ToTensor(),
+            T.ToDtype(torch.float32, scale=True),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         ])
 
     dataset = (
@@ -169,7 +169,7 @@ def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
         )
         .compose(wds.split_by_worker)
         .shuffle(5000 if is_training else 0)
-        .decode("pil")
+        .decode("torchrgb")
         .to_tuple("jpg;jpeg;png", "cls")
         .map_tuple(transform, identity_label)
         .batched(batch_size, partial=not is_training)
