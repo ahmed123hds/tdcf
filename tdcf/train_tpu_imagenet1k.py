@@ -445,27 +445,34 @@ def train_process(index, args):
             para_pilot = pl_pilot.per_device_loader(device)
             model.train()
 
-            for step, batch in enumerate(para_pilot):
-                if step >= pilot_steps:
-                    break
-                images, labels = batch
-                labels = labels.long()
-                coeffs = block_dct2d(images, block_size=args.block_size).detach().requires_grad_(True)
-                x = block_idct2d(coeffs, nph, npw)
+            try:
+                for step, batch in enumerate(para_pilot):
+                    if step >= pilot_steps:
+                        break
+                    images, labels = batch
+                    labels = labels.long()
+                    coeffs = block_dct2d(images, block_size=args.block_size).detach().requires_grad_(True)
+                    x = block_idct2d(coeffs, nph, npw)
 
-                pilot_opt.zero_grad(set_to_none=True)
-                with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
-                    logits = model(x)
-                    loss = criterion(logits, labels)
-                loss.backward()
+                    pilot_opt.zero_grad(set_to_none=True)
+                    with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
+                        logits = model(x)
+                        loss = criterion(logits, labels)
+                    loss.backward()
 
-                if coeffs.grad is not None:
-                    accumulate_block_sensitivity(estimator, coeffs.grad)
+                    if coeffs.grad is not None:
+                        accumulate_block_sensitivity(estimator, coeffs.grad)
 
-                xm.reduce_gradients(pilot_opt)
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                xm.optimizer_step(pilot_opt)
+                    xm.reduce_gradients(pilot_opt)
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    xm.optimizer_step(pilot_opt)
+            finally:
+                # Pilot only consumes a prefix of the WebDataset epoch. Explicitly
+                # close the ParallelLoader so unread background work does not leak
+                # into the next pilot epoch and stall the input pipeline.
+                del para_pilot
+                pl_pilot.close()
 
             estimator.finalize_epoch()
             pilot_epoch_time = time.time() - pilot_epoch_start_time
