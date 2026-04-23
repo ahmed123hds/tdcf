@@ -18,9 +18,14 @@ export PJRT_DEVICE=TPU
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-TRAIN_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
-VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
-SAVE_DIR='./results/imagenet1k_cap90'
+TRAIN_SHARDS="${TRAIN_SHARDS:-/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar}"
+VAL_SHARDS="${VAL_SHARDS:-/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar}"
+# Milder default than the original 0.4→0.9 schedule. This keeps cap90 as a
+# high-budget run instead of an average-60%-I/O curriculum.
+SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_cap90_mild}"
+BETA="${BETA:-0.6}"
+MAX_BETA="${MAX_BETA:-0.9}"
+GAMMA="${GAMMA:-1.0}"
 MAX_RETRIES=20
 RETRY_WAIT=30
 
@@ -55,7 +60,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         --weight_decay 1e-4 --warmup_epochs 5 \
         --label_smooth 0.1 --grad_clip 1.0 \
         --amp_bf16 --num_workers 32 \
-        --budget_mode --beta 0.4 --max_beta 0.9 --gamma 1.5 \
+        --budget_mode --beta "$BETA" --max_beta "$MAX_BETA" --gamma "$GAMMA" \
         --k_low 1 \
         --save_dir "$SAVE_DIR" \
         $RESUME_FLAG \

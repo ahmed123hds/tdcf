@@ -276,6 +276,49 @@ def _topk_mask(scores: torch.Tensor, q: int) -> torch.Tensor:
     return mask
 
 
+def _normalize_positive_schedule_rows(schedule: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    schedule = np.clip(schedule, eps, None)
+    denom = schedule.sum(axis=1, keepdims=True)
+    denom = np.where(denom > 0, denom, 1.0)
+    return schedule / denom
+
+
+def _fit_sensitivity_schedule(history, total_epochs: int, eps: float = 1e-8) -> np.ndarray | None:
+    """
+    Extend pilot sensitivity distributions to the full training horizon.
+
+    The previous implementation froze the last pilot snapshot and reused it
+    for every later epoch. That makes the allocation policy effectively stop
+    evolving after the pilot phase. Here we keep the measured pilot epochs
+    exact, then continue them with a per-dimension linear trend fit.
+    """
+    if not history:
+        return None
+
+    hist = np.asarray(history, dtype=np.float64)
+    if hist.ndim != 2:
+        raise ValueError(f"Expected 2D sensitivity history, got shape {hist.shape}")
+
+    pilot_epochs, dim = hist.shape
+    if pilot_epochs == 1:
+        sched = np.repeat(hist, total_epochs, axis=0)
+        return _normalize_positive_schedule_rows(sched, eps=eps)
+
+    x = np.arange(pilot_epochs, dtype=np.float64)
+    x_centered = x - x.mean()
+    denom = float(np.dot(x_centered, x_centered))
+
+    y_mean = hist.mean(axis=0)
+    slope = ((x_centered[:, None]) * (hist - y_mean)).sum(axis=0) / max(denom, eps)
+    intercept = y_mean - slope * x.mean()
+
+    x_all = np.arange(total_epochs, dtype=np.float64)[:, None]
+    sched = intercept[None, :] + x_all * slope[None, :]
+    # Preserve measured pilot epochs exactly; only extrapolate past the pilot.
+    sched[:pilot_epochs] = hist
+    return _normalize_positive_schedule_rows(sched, eps=eps)
+
+
 def compute_k_allocation(
     coeffs: torch.Tensor,
     patch_sensitivity,
@@ -434,6 +477,8 @@ def train_process(index, args):
 
     train_loader = build_wds_loader(args.train_shards, args.batch_size, args, True)
     pilot_loader = build_wds_loader(args.train_shards, args.batch_size, args, True)
+    patch_sensitivity_schedule = None
+    band_sensitivity_schedule = None
     # Pilot
     if not args.skip_pilot:
         if xm.is_master_ordinal():
@@ -488,8 +533,19 @@ def train_process(index, args):
                 )
 
         scheduler.fit_from_pilot(estimator, args.epochs)
+        patch_sensitivity_schedule = _fit_sensitivity_schedule(
+            estimator.patch_sensitivity_history, args.epochs
+        )
+        band_sensitivity_schedule = _fit_sensitivity_schedule(
+            estimator.band_sensitivity_history, args.epochs
+        )
         if xm.is_master_ordinal():
             print(scheduler.summary())
+            if patch_sensitivity_schedule is not None and band_sensitivity_schedule is not None:
+                print(
+                    "  Allocation policy: extrapolated pilot sensitivity schedule "
+                    f"({len(estimator.patch_sensitivity_history)} measured epochs -> {args.epochs} training epochs)"
+                )
             print("\n[ADAPTIVE TRAINING PHASE]")
     else:
         if xm.is_master_ordinal():
@@ -524,10 +580,14 @@ def train_process(index, args):
         ps_t = None
         bs_t = None
         if not args.skip_pilot:
-            ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
-            bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
-            ps = estimator.patch_sensitivity_history[ps_idx]
-            bs = estimator.band_sensitivity_history[bs_idx]
+            if patch_sensitivity_schedule is not None and band_sensitivity_schedule is not None:
+                ps = patch_sensitivity_schedule[ep]
+                bs = band_sensitivity_schedule[ep]
+            else:
+                ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
+                bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
+                ps = estimator.patch_sensitivity_history[ps_idx]
+                bs = estimator.band_sensitivity_history[bs_idx]
             # Materialize policy tensors once per epoch instead of once per batch.
             ps_t = torch.as_tensor(ps, device=device, dtype=torch.float32)
             bs_t = torch.as_tensor(bs, device=device, dtype=torch.float32)
