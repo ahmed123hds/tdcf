@@ -440,6 +440,7 @@ def train_process(index, args):
             print(f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, ~{pilot_steps} steps/epoch")
 
         for ep in range(args.pilot_epochs):
+            pilot_epoch_start_time = time.time()
             pl_pilot = pl.ParallelLoader(pilot_loader, [device])
             para_pilot = pl_pilot.per_device_loader(device)
             model.train()
@@ -467,6 +468,7 @@ def train_process(index, args):
                 xm.optimizer_step(pilot_opt)
 
             estimator.finalize_epoch()
+            pilot_epoch_time = time.time() - pilot_epoch_start_time
             if xm.is_master_ordinal():
                 K = estimator.compute_band_cutoff(ep, args.eta_f)
                 q = estimator.compute_patch_quota(ep, args.eta_s)
@@ -474,7 +476,8 @@ def train_process(index, args):
                 print(
                     f"  Pilot {ep+1:2d}/{args.pilot_epochs} | "
                     f"K_high={K:2d}/{args.num_bands} | q={q:3d}/{num_patches} | "
-                    f"band_low={bs[0]:.4f} band_high={bs[-1]:.4f}"
+                    f"band_low={bs[0]:.4f} band_high={bs[-1]:.4f} | "
+                    f"{pilot_epoch_time:.1f}s"
                 )
 
         scheduler.fit_from_pilot(estimator, args.epochs)
