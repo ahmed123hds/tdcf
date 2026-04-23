@@ -1,8 +1,8 @@
-import os
-import time
-import math
-import random
 import argparse
+import math
+import os
+import random
+import time
 import traceback
 
 import numpy as np
@@ -16,11 +16,14 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
 from torch.utils.data import DataLoader, Sampler
-from torch.utils.data.distributed import DistributedSampler
 
+from tdcf.bucketed_store import (
+    BucketBatchSampler,
+    BucketedTileBandDataset,
+    BucketedTileBandStore,
+)
 from tdcf.sensitivity import BlockSensitivityEstimator
-from tdcf.scheduler import FidelityScheduler, BudgetScheduler
-from tdcf.io_dataloader import CropAwareBlockBandStore, BlockBandDataset
+from tdcf.scheduler import BudgetScheduler
 
 
 os.environ.setdefault("PJRT_DEVICE", "TPU")
@@ -52,10 +55,65 @@ class ShardSampler(Sampler):
         return len(self.indices)
 
 
+class BucketPilotStats:
+    """
+    Pilot statistics for variable-shape bucket batches.
+
+    Band sensitivity is global across all buckets.
+    Patch sensitivity is stored per bucket, so bucket-aware policies can still
+    use a spatial prior without forcing a fake global patch grid.
+    """
+
+    def __init__(self, block_size: int, num_bands: int, device: torch.device):
+        self.block_size = block_size
+        self.num_bands = num_bands
+        self.device = device
+        self.estimator = BlockSensitivityEstimator(block_size, 1, 1, num_bands, device=device)
+        self.band_sensitivity_history = []
+        self.patch_sensitivity_history_by_bucket = {}
+        self._band_accum = torch.zeros(num_bands, device=device)
+        self._patch_accum_by_bucket = {}
+        self._patch_count_by_bucket = {}
+        self._step_count = 0
+
+    def begin_epoch(self):
+        self._band_accum.zero_()
+        self._patch_accum_by_bucket = {}
+        self._patch_count_by_bucket = {}
+        self._step_count = 0
+
+    def accumulate(self, bucket_id: int, P_bucket: int, grad: torch.Tensor):
+        patch_sens = grad.abs().sum(dim=(2, 3, 4)).mean(dim=0)
+        if bucket_id not in self._patch_accum_by_bucket:
+            self._patch_accum_by_bucket[bucket_id] = torch.zeros(P_bucket, device=self.device)
+            self._patch_count_by_bucket[bucket_id] = 0
+        self._patch_accum_by_bucket[bucket_id] += patch_sens
+        self._patch_count_by_bucket[bucket_id] += 1
+
+        grad_flat = grad.abs().mean(dim=(0, 1)).sum(dim=0).reshape(-1)
+        for b, band_idx in enumerate(self.estimator.bands):
+            self._band_accum[b] += grad_flat[band_idx.to(self.device)].sum()
+        self._step_count += 1
+
+    def finalize_epoch(self):
+        if self._step_count == 0:
+            return
+        band_bar = (self._band_accum / self._step_count).cpu()
+        s_e = band_bar / (band_bar.sum() + 1e-8)
+        self.band_sensitivity_history.append(s_e.numpy().copy())
+
+        for bucket_id, patch_accum in self._patch_accum_by_bucket.items():
+            g_bar = (patch_accum / max(self._patch_count_by_bucket[bucket_id], 1)).cpu()
+            g_tilde = g_bar / (g_bar.sum() + 1e-8)
+            self.patch_sensitivity_history_by_bucket.setdefault(bucket_id, []).append(
+                g_tilde.numpy().copy()
+            )
+
+
 def parse_args():
-    p = argparse.ArgumentParser("TDCF ImageNet-1K TPU Store Trainer")
+    p = argparse.ArgumentParser("TDCF ImageNet-1K TPU Bucket Store Trainer")
     p.add_argument("--data_dir", type=str, required=True,
-                   help="Root containing train/ and val/ crop-aware stores.")
+                   help="Root containing train/ and val/ bucketed stores.")
     p.add_argument("--save_dir", type=str, default="./results/tdcf_imagenet1k_store")
 
     p.add_argument("--backbone", choices=["resnet50", "vit_b16"], default="resnet50")
@@ -78,15 +136,13 @@ def parse_args():
     p.add_argument("--label_smooth", type=float, default=0.1)
     p.add_argument("--amp_bf16", action="store_true")
 
-    p.add_argument("--eta_f", type=float, default=0.9)
-    p.add_argument("--eta_s", type=float, default=0.85)
-    p.add_argument("--patch_policy", choices=["gradient", "random", "static", "greedy"],
-                   default="greedy")
     p.add_argument("--budget_mode", action="store_true")
     p.add_argument("--beta", type=float, default=0.5)
     p.add_argument("--max_beta", type=float, default=1.0)
     p.add_argument("--gamma", type=float, default=1.5)
     p.add_argument("--k_low", type=int, default=1)
+    p.add_argument("--patch_policy", choices=["gradient", "random", "static", "greedy"],
+                   default="greedy")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save_every", type=int, default=10)
@@ -133,25 +189,13 @@ def make_scheduler(args, optimizer, total_epochs: int):
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def make_loader(dataset, batch_size, sampler, drop_last):
+def make_loader(dataset, batch_sampler):
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        sampler=sampler,
+        batch_sampler=batch_sampler,
         num_workers=0,
-        drop_last=drop_last,
         pin_memory=False,
     )
-
-
-def accumulate_block_sensitivity(estimator, coeffs_grad: torch.Tensor):
-    grad = coeffs_grad.detach()
-    patch_sens = grad.abs().sum(dim=(2, 3, 4)).mean(dim=0)
-    estimator._patch_accum += patch_sens
-    grad_flat = grad.abs().mean(dim=(0, 1)).sum(dim=0).reshape(-1)
-    for b, band_idx in enumerate(estimator.bands):
-        estimator._band_accum[b] += grad_flat[band_idx.to(grad.device)].sum()
-    estimator._step_count += 1
 
 
 def train_process(index, args):
@@ -165,70 +209,89 @@ def train_process(index, args):
     np.random.seed(seed)
     random.seed(seed)
 
-    train_store = CropAwareBlockBandStore(
+    train_store = BucketedTileBandStore(
         os.path.join(args.data_dir, "train"), device=device, output_size=args.img_size
     )
-    val_store = CropAwareBlockBandStore(
+    val_store = BucketedTileBandStore(
         os.path.join(args.data_dir, "val"), device=device, output_size=args.img_size
     )
 
-    train_dataset = BlockBandDataset(train_store)
-    val_dataset = BlockBandDataset(val_store)
+    train_dataset = BucketedTileBandDataset(train_store)
+    val_dataset = BucketedTileBandDataset(val_store)
 
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    train_batch_sampler = BucketBatchSampler(
+        train_store.sample_bucket_ids,
+        batch_size=args.batch_size,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=True,
+        seed=args.seed,
     )
-    val_sampler = ShardSampler(len(val_dataset), num_replicas=world_size, rank=rank)
+    val_batch_sampler = BucketBatchSampler(
+        val_store.sample_bucket_ids,
+        batch_size=args.eval_batch_size,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+        seed=args.seed,
+    )
 
-    train_loader = make_loader(train_dataset, args.batch_size, train_sampler, drop_last=True)
-    val_loader = make_loader(val_dataset, args.eval_batch_size, val_sampler, drop_last=False)
+    train_loader = make_loader(train_dataset, train_batch_sampler)
+    val_loader = make_loader(val_dataset, val_batch_sampler)
 
     global_bs = args.batch_size * world_size
     scaled_lr = args.base_lr * (global_bs / float(args.lr_ref_batch))
     pilot_lr = args.pilot_lr if args.pilot_lr is not None else args.base_lr
     scaled_pilot_lr = pilot_lr * (global_bs / float(args.lr_ref_batch))
 
-    estimator = BlockSensitivityEstimator(
-        train_store.bs_h, train_store.nph, train_store.npw,
-        train_store.num_bands, device=device
+    if not args.skip_pilot and not args.budget_mode:
+        raise ValueError(
+            "Bucketed store trainer currently supports baseline (--skip_pilot) "
+            "and budget_mode runs only."
+        )
+
+    pilot_stats = BucketPilotStats(
+        block_size=train_store.block_size,
+        num_bands=train_store.num_bands,
+        device=device,
     )
 
     if args.budget_mode:
         scheduler = BudgetScheduler(
-            train_store.num_bands, train_store.P,
-            beta=args.beta, max_beta=args.max_beta,
-            gamma=args.gamma, k_low=args.k_low,
+            train_store.num_bands,
+            num_patches=196,
+            beta=args.beta,
+            max_beta=args.max_beta,
+            gamma=args.gamma,
+            k_low=args.k_low,
         )
     else:
-        scheduler = FidelityScheduler(
-            train_store.num_bands, train_store.P, args.eta_f, args.eta_s
-        )
+        scheduler = None
 
     model = build_model(args, device)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
     pilot_opt = make_optimizer(args, model, scaled_pilot_lr)
 
-    train_steps = math.ceil(len(train_dataset) / global_bs)
+    train_steps = len(train_loader)
     pilot_steps = max(1, int(train_steps * args.pilot_ratio))
 
     if is_master:
         print("=" * 72)
         print(
-            f"TDCF ImageNet-1K Store | backbone={args.backbone} | img={args.img_size} | "
-            f"canvas_patches={train_store.P} | global_bs={global_bs}"
+            f"TDCF ImageNet-1K Bucket Store | backbone={args.backbone} | img={args.img_size} | "
+            f"buckets(train)={len(train_store.bucket_infos)} | global_bs={global_bs}"
         )
         print("=" * 72)
 
     if not args.skip_pilot:
         if is_master:
-            print(f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, ~{pilot_steps} steps/epoch")
-
-        train_store.set_fidelity(
-            train_store.num_bands, train_store.num_bands, train_store.P,
-            patch_policy="gradient"
-        )
+            print(f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, ~{pilot_steps} bucketed steps/epoch")
+        train_store.set_full_fidelity()
         for ep in range(args.pilot_epochs):
-            train_sampler.set_epoch(ep)
+            train_batch_sampler.set_epoch(ep)
+            pilot_stats.begin_epoch()
             model.train()
             pilot_step = 0
 
@@ -237,9 +300,10 @@ def train_process(index, args):
                     break
                 idx_np = indices.numpy()
                 labels = labels.to(device)
-                coeffs, crop_params, _visible, _k = train_store.read_coeffs(idx_np)
-                coeffs = coeffs.to(device, non_blocking=True).detach().requires_grad_(True)
-                x = train_store.reconstruct_crops(coeffs, idx_np, crop_params)
+                coeffs_zz, crop_params, _visible, _k, bucket_id = train_store.read_coeffs(idx_np)
+                bucket = train_store.bucket_infos[bucket_id]
+                coeffs_zz = coeffs_zz.to(device, non_blocking=True).detach().requires_grad_(True)
+                x = train_store.reconstruct_crops(coeffs_zz, idx_np, crop_params, bucket_id)
 
                 pilot_opt.zero_grad(set_to_none=True)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
@@ -247,8 +311,15 @@ def train_process(index, args):
                     loss = criterion(logits, labels)
                 loss.backward()
 
-                if coeffs.grad is not None:
-                    accumulate_block_sensitivity(estimator, coeffs.grad)
+                if coeffs_zz.grad is not None:
+                    grad = coeffs_zz.grad.reshape(
+                        coeffs_zz.grad.shape[0],
+                        bucket.P,
+                        coeffs_zz.grad.shape[2],
+                        train_store.block_size,
+                        train_store.block_size,
+                    )
+                    pilot_stats.accumulate(bucket_id, bucket.P, grad)
 
                 xm.reduce_gradients(pilot_opt)
                 if args.grad_clip > 0:
@@ -256,19 +327,17 @@ def train_process(index, args):
                 xm.optimizer_step(pilot_opt)
                 pilot_step += 1
 
-            estimator.finalize_epoch()
+            pilot_stats.finalize_epoch()
             if is_master:
-                K = estimator.compute_band_cutoff(ep, args.eta_f)
-                q = estimator.compute_patch_quota(ep, args.eta_s)
-                bs = estimator.band_sensitivity_history[ep]
+                bs = pilot_stats.band_sensitivity_history[-1]
                 print(
                     f"  Pilot {ep+1:2d}/{args.pilot_epochs} | "
-                    f"K_high={K:2d}/{train_store.num_bands} | q={q:3d}/{train_store.P} | "
-                    f"band_low={bs[0]:.4f} band_high={bs[-1]:.4f}",
+                    f"band_low={bs[0]:.4f} band_high={bs[-1]:.4f} | "
+                    f"bucket_stats={len(pilot_stats.patch_sensitivity_history_by_bucket)}",
                     flush=True,
                 )
 
-        scheduler.fit_from_pilot(estimator, args.epochs)
+        scheduler.fit_from_pilot(pilot_stats, args.epochs)
         if is_master:
             print(scheduler.summary())
             print("\n[ADAPTIVE TRAINING PHASE]")
@@ -294,40 +363,25 @@ def train_process(index, args):
         best_acc = ckpt.get("best_acc", 0.0)
 
     for ep in range(start_epoch, args.epochs):
-        if not args.skip_pilot:
-            ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
-            bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
-            ps = estimator.patch_sensitivity_history[ps_idx]
-            bs = estimator.band_sensitivity_history[bs_idx]
-        else:
-            ps = bs = None
-
         if args.skip_pilot:
-            train_store.set_fidelity(
-                train_store.num_bands, train_store.num_bands, train_store.P,
-                patch_policy="gradient"
-            )
-        elif args.budget_mode:
-            budget = scheduler.get_budget(ep)
-            train_store.set_budget(
-                budget, patch_sensitivity=ps, band_sensitivity=bs,
-                k_low=args.k_low, patch_policy=args.patch_policy
-            )
+            train_store.set_full_fidelity()
         else:
-            K_high, q_e = scheduler.get_fidelity(ep)
-            train_store.set_fidelity(
-                K_high, args.k_low, q_e,
-                patch_sensitivity=ps, band_sensitivity=bs,
-                patch_policy=args.patch_policy
+            ratio = scheduler.get_io_ratio(ep)
+            patch_stats = {
+                bucket_id: hist[min(ep, len(hist) - 1)]
+                for bucket_id, hist in pilot_stats.patch_sensitivity_history_by_bucket.items()
+            }
+            train_store.set_budget_ratio(
+                ratio,
+                patch_sensitivity_by_bucket=patch_stats,
+                band_sensitivity=pilot_stats.band_sensitivity_history[min(ep, len(pilot_stats.band_sensitivity_history) - 1)],
+                k_low=args.k_low,
+                patch_policy=args.patch_policy,
             )
-
-        val_store.set_fidelity(
-            val_store.num_bands, val_store.num_bands, val_store.P,
-            patch_policy="gradient"
-        )
+        val_store.set_full_fidelity()
 
         train_store.reset_epoch_io()
-        train_sampler.set_epoch(ep)
+        train_batch_sampler.set_epoch(ep)
         model.train()
 
         tr_loss_accum = 0.0
@@ -339,16 +393,19 @@ def train_process(index, args):
         for step, (indices, labels) in enumerate(train_loader):
             idx_np = indices.numpy()
             labels = labels.to(device)
-            x, _crop, _visible, _k = train_store.serve_indices(idx_np, deterministic_val=False)
+            x, _crop, _visible, _k, _bucket_id = train_store.serve_indices(
+                idx_np, deterministic_val=False
+            )
 
             if step == 0 and is_master:
-                print("  -> Got first batch from store loader! Building XLA graph...", flush=True)
+                print("  -> Got first batch from bucket store! Building XLA graph...", flush=True)
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                 logits = model(x)
                 loss = criterion(logits, labels)
             loss.backward()
+
             xm.reduce_gradients(opt)
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -380,9 +437,9 @@ def train_process(index, args):
                     )
                     step_start = time.time()
 
-        tr_n_total = xm.mesh_reduce(f"store_tr_n_{ep}", tr_n_accum, sum)
-        tr_corr_total = xm.mesh_reduce(f"store_tr_corr_{ep}", tr_corr_accum, sum)
-        tr_loss_total = xm.mesh_reduce(f"store_tr_loss_{ep}", tr_loss_accum, sum)
+        tr_n_total = xm.mesh_reduce(f"bucket_tr_n_{ep}", tr_n_accum, sum)
+        tr_corr_total = xm.mesh_reduce(f"bucket_tr_corr_{ep}", tr_corr_accum, sum)
+        tr_loss_total = xm.mesh_reduce(f"bucket_tr_loss_{ep}", tr_loss_accum, sum)
         tr_acc = tr_corr_total / tr_n_total if tr_n_total > 0 else 0.0
         tr_loss = tr_loss_total / tr_n_total if tr_n_total > 0 else 0.0
         train_time = time.time() - train_start
@@ -397,7 +454,9 @@ def train_process(index, args):
             for indices, labels in val_loader:
                 idx_np = indices.numpy()
                 labels = labels.to(device)
-                x, _crop, _visible, _k = val_store.serve_indices(idx_np, deterministic_val=True)
+                x, _crop, _visible, _k, _bucket_id = val_store.serve_indices(
+                    idx_np, deterministic_val=True
+                )
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
                     loss = criterion(logits, labels)
@@ -406,40 +465,34 @@ def train_process(index, args):
                 va_corr_accum += (logits.argmax(1) == labels).sum().item()
                 va_n_accum += batch_n
 
-        va_n_total = xm.mesh_reduce(f"store_va_n_{ep}", va_n_accum, sum)
-        va_corr_total = xm.mesh_reduce(f"store_va_corr_{ep}", va_corr_accum, sum)
-        va_loss_total = xm.mesh_reduce(f"store_va_loss_{ep}", va_loss_accum, sum)
+        va_n_total = xm.mesh_reduce(f"bucket_va_n_{ep}", va_n_accum, sum)
+        va_corr_total = xm.mesh_reduce(f"bucket_va_corr_{ep}", va_corr_accum, sum)
+        va_loss_total = xm.mesh_reduce(f"bucket_va_loss_{ep}", va_loss_accum, sum)
         va_acc = va_corr_total / va_n_total if va_n_total > 0 else 0.0
         va_loss = va_loss_total / va_n_total if va_n_total > 0 else 0.0
         val_time = time.time() - val_start
 
         io_ratio = train_store.get_io_ratio()
+        read_stats = train_store.get_read_stats()
         sched_lr.step()
 
         if is_master:
             if args.skip_pilot:
                 print(
-                    f"E {ep+1:3d}/{args.epochs} | IO={io_ratio:.3f} (store baseline) | "
+                    f"E {ep+1:3d}/{args.epochs} | IO={io_ratio:.3f} (bucket baseline) | "
                     f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} ({train_time:.1f}s) | "
                     f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} ({val_time:.1f}s) | "
-                    f"LR={opt.param_groups[0]['lr']:.2e}",
-                    flush=True,
-                )
-            elif args.budget_mode:
-                budget = scheduler.get_budget(ep)
-                print(
-                    f"E {ep+1:3d}/{args.epochs} | Budget={budget:4d}/{train_store.P * train_store.num_bands} | "
-                    f"IO={io_ratio:.3f} | Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} ({train_time:.1f}s) | "
-                    f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} ({val_time:.1f}s) | "
+                    f"Reads={read_stats['read_ops_epoch']} avg_bytes/read={read_stats['avg_bytes_per_read']:.1f} | "
                     f"LR={opt.param_groups[0]['lr']:.2e}",
                     flush=True,
                 )
             else:
-                K_high, q_e = scheduler.get_fidelity(ep)
+                ratio = scheduler.get_io_ratio(ep)
                 print(
-                    f"E {ep+1:3d}/{args.epochs} | K_hi={K_high} K_lo={args.k_low} q={q_e} | "
+                    f"E {ep+1:3d}/{args.epochs} | BudgetRatio={ratio:.3f} | "
                     f"IO={io_ratio:.3f} | Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} ({train_time:.1f}s) | "
                     f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} ({val_time:.1f}s) | "
+                    f"Reads={read_stats['read_ops_epoch']} avg_bytes/read={read_stats['avg_bytes_per_read']:.1f} | "
                     f"LR={opt.param_groups[0]['lr']:.2e}",
                     flush=True,
                 )
@@ -468,7 +521,7 @@ def train_process_entry(index, args):
     try:
         train_process(index, args)
     except Exception:
-        print(f"[rank {index}] Unhandled exception in TPU store worker", flush=True)
+        print(f"[rank {index}] Unhandled exception in TPU bucket-store worker", flush=True)
         traceback.print_exc()
         raise
 

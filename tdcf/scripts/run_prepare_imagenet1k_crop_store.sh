@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Build a crop-aware ImageNet-1K block-DCT store.
+# Build a bucketed, tiled, band-grouped ImageNet-1K block-DCT store.
 # Usage: bash tdcf/scripts/run_prepare_imagenet1k_crop_store.sh
 # =============================================================================
 
@@ -16,6 +16,7 @@ TRAIN_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
 VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
 OUT_ROOT='./data/imagenet1k_crop_block_store'
 DEVICE="${DEVICE:-cuda}"
+TILE_BLOCKS="${TILE_BLOCKS:-4}"
 
 mkdir -p "${OUT_ROOT}"
 
@@ -25,6 +26,7 @@ python3 -m tdcf.prepare_imagenet1k_crop_store \
     --resize_shorter 256 \
     --block_size 16 \
     --num_bands 16 \
+    --tile_blocks "${TILE_BLOCKS}" \
     --batch_size 64 \
     --num_workers 8 \
     --device "${DEVICE}"
@@ -35,6 +37,7 @@ python3 -m tdcf.prepare_imagenet1k_crop_store \
     --resize_shorter 256 \
     --block_size 16 \
     --num_bands 16 \
+    --tile_blocks "${TILE_BLOCKS}" \
     --batch_size 64 \
     --num_workers 8 \
     --device "${DEVICE}"
