@@ -18,8 +18,12 @@ export PJRT_DEVICE=TPU
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-TRAIN_SHARDS="${TRAIN_SHARDS:-/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar}"
-VAL_SHARDS="${VAL_SHARDS:-/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar}"
+if [ -z "${TRAIN_SHARDS:-}" ]; then
+    TRAIN_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
+fi
+if [ -z "${VAL_SHARDS:-}" ]; then
+    VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
+fi
 SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_cap70_mild}"
 BETA="${BETA:-0.5}"
 MAX_BETA="${MAX_BETA:-0.7}"
