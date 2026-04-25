@@ -24,8 +24,8 @@ fi
 if [ -z "${VAL_SHARDS:-}" ]; then
     VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
 fi
-SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_cap80_mild}"
-BETA="${BETA:-0.55}"
+SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_cap80_mild_v2}"
+BETA="${BETA:-0.6}"
 MAX_BETA="${MAX_BETA:-0.8}"
 GAMMA="${GAMMA:-1.0}"
 MAX_RETRIES=20
