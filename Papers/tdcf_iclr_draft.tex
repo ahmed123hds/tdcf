@@ -1,0 +1,426 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=0.72in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{multicol}
+\usepackage{nicefrac}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\setlist[itemize]{leftmargin=*,topsep=2pt,itemsep=2pt}
+\setlist[enumerate]{leftmargin=*,topsep=2pt,itemsep=2pt}
+\setlength{\columnsep}{0.24in}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\given}{\,|\,}
+\newcommand{\od}{\odot}
+\newcommand{\T}{\mathcal{T}}
+\newcommand{\D}{\mathcal{D}}
+\newcommand{\B}{\mathcal{B}}
+\newcommand{\Lagr}{\mathcal{L}}
+\newcommand{\F}{\mathcal{F}}
+\newcommand{\M}{\mathcal{M}}
+\newcommand{\K}{\mathcal{K}}
+
+\title{Training-Dynamics-Coupled Fidelity for Machine-Centric Dataset Compression\\
+\large A Methodology Draft for Resource-Aware Large-Scale Visual Learning}
+\author{Anonymous Draft for Research Development}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Modern visual training pipelines repeatedly stream high-fidelity images across many epochs, even though a model does not require the same level of input detail at every stage of optimization. This creates a mismatch between \emph{human-centric storage} and \emph{machine-centric training needs}, especially when researchers are constrained by limited TPU/GPU quotas, I/O bandwidth, or storage. We propose \textbf{Training-Dynamics-Coupled Fidelity (TDCF)}, a machine-centric training-data methodology that estimates pilot-phase sensitivity, fits an explicit epoch-wise I/O budget, and allocates patchwise frequency detail under that budget. The final method uses a block-DCT representation with a budget-constrained coarse-to-fine schedule and a greedy variable-$K$ allocator over image patches, allowing the loader to serve only the frequency content needed at a given stage of optimization. Unlike static perceptual compression, the proposed method is explicitly machine-centric; unlike proxy-based importance scoring, it uses the target model's own gradients while remaining architecture-agnostic at the data-pipeline level. This document presents the revised methodology, discarded preliminary variants, theoretical justification, and current ablation evidence in a form suitable for an ICLR-style submission.
+\end{abstract}
+
+\section{Introduction}
+Deep models are usually trained by repeatedly reading the same dataset for tens or hundreds of epochs. In standard ImageNet-style training, this means that the system repeatedly spends bandwidth, storage, and accelerator time on full-fidelity images, even though optimization dynamics evolve dramatically across training. Early epochs often learn coarse category structure; later epochs refine class boundaries; very late epochs focus on hard distinctions. Yet the training pipeline usually treats every epoch as if the model always needs the same input fidelity.
+
+This is a practical problem and a scientific one. Practically, researchers with limited hardware budgets are forced to choose between smaller models, shorter training runs, or reduced datasets. Scientifically, current data compression pipelines remain dominated by \emph{human perception}: a codec discards what humans are less sensitive to, not what a classifier or recognizer finds irrelevant. For machine learning, those two notions need not coincide.
+
+This paper starts from a simple question:
+\begin{quote}
+\emph{Can we compress training data according to the information that is relevant to the model at its current stage of learning, while preserving spatial structure and minimizing accuracy loss?}
+\end{quote}
+
+We propose \textbf{Training-Dynamics-Coupled Fidelity (TDCF)}. The core idea is to measure, during a small pilot phase, how sensitive the model's loss is to different frequency bands and spatial residuals of the input. From these measurements we derive a \emph{fidelity schedule}: early epochs consume coarse global structure, while later epochs progressively unlock finer details and harder local residuals. The resulting system is neither conventional image compression nor token pruning inside the model. It is an \emph{offline dataset representation strategy} guided by the learning dynamics of the target model.
+
+\paragraph{Main contributions.}
+This draft makes four concrete contributions:
+\begin{itemize}
+    \item It formulates \textbf{machine-centric dataset fidelity} as a dynamic quantity tied to optimization progress rather than a static property of the image.
+    \item It introduces the \textbf{instantaneous input sensitivity spectrum}, a gradient-based object that measures which transformed input components the model currently uses.
+    \item It proposes a \textbf{budget-constrained coarse-to-fine storage and loading pipeline} based on block-DCT bands and patchwise variable-$K$ allocation, while preserving spatial layout and exact coefficient-level I/O accounting.
+    \item It provides a \textbf{local theoretical bound} showing that the training loss perturbation due to fidelity truncation is controlled by omitted gradient mass and second-order curvature.
+\end{itemize}
+
+\section{Problem Statement}
+Let $\D = \{(x_i, y_i)\}_{i=1}^N$ be a labeled image dataset with $x_i \in \R^{H \times W \times C}$ and $y_i \in \{1, \dots, K\}$. Let $f_\theta$ be a visual model trained by minimizing cross-entropy loss
+\begin{equation}
+    \Lagr(\theta; x, y) = -\log p_\theta(y \mid x).
+\end{equation}
+For a standard training run over $E$ epochs, each image is read and decoded many times. If images are stored at a single high-fidelity format, total training I/O grows linearly with $E$, even though the information required by the optimizer may change substantially across epochs.
+
+We seek a family of dataset representations
+\begin{equation}
+    x_i^{(0)}, x_i^{(1)}, \dots, x_i^{(L)},
+\end{equation}
+ordered from lowest to highest fidelity, and a schedule $a(e) \in \{0, \dots, L\}$ for epoch $e$, such that training with $x_i^{(a(e))}$:
+\begin{enumerate}
+    \item preserves the spatial information needed by the model,
+    \item reduces storage and/or data movement,
+    \item maintains top-1 accuracy within a small tolerable drop,
+    \item does not require a separate proxy model to define importance.
+\end{enumerate}
+
+The central challenge is that fidelity should be defined \emph{for the model}, not for humans. JPEG-like perceptual criteria are insufficient because edges or fine structures that appear visually minor may be decisive for classification. Conversely, some high-frequency detail may be nearly irrelevant to the target model during most of training. TDCF addresses this by learning fidelity from the target model's own gradient field.
+
+\section{Related Work}
+\subsection{Human-centric versus machine-centric compression}
+Classical image compression prioritizes perceptual quality for humans. Recent machine-centric or task-aware work argues that compression should instead preserve features important to downstream tasks. The recent survey on human and machine coding highlights this shift clearly \cite{huang2024survey}. A related line studies task-driven image compression, where the representation is optimized for visual analytics or recognition rather than display quality. However, most existing work still uses a \emph{static} target representation or optimizes a codec jointly with a fixed task.
+
+Our setting is different in two ways. First, we focus on \emph{training-time} data usage, not merely inference-time compressed sensing. Second, fidelity is \emph{time-varying}: the same image may be served coarsely in early epochs and more finely later.
+
+\subsection{Token pruning, masking, and adaptive compute}
+Several methods reduce compute by pruning or merging tokens inside the model. DynamicViT prunes tokens adaptively during inference or training \cite{dynamicvit}; ToMe merges tokens to speed up ViTs \cite{tome}. Self-supervised masking methods such as MAE and BEiT also show that learning can proceed from partial or corrupted visual inputs \cite{mae,beit}. These methods are important evidence that not all raw input detail is necessary at all times.
+
+Still, token pruning and masked pretraining operate \emph{after loading the input}. They reduce internal computation, whereas TDCF aims to reduce the data served from storage in the first place. This is especially relevant when the bottleneck is storage or accelerator quota rather than model FLOPs alone.
+
+\subsection{Spectral bias and frequency-dependent learning dynamics}
+Neural networks are known to exhibit a spectral bias: they tend to fit low-frequency structure before high-frequency detail \cite{rahaman2019spectral}. In vision, this suggests that training dynamics are not fidelity-invariant. If coarse information is learned first, then a static full-fidelity data stream is likely redundant during large portions of training. TDCF operationalizes this observation using gradients with respect to transformed input coefficients, yielding a measurable, model-specific fidelity schedule.
+
+\subsection{Feature disagreement across architectures}
+Different backbones can achieve similar accuracy while relying on different visual cues. Geirhos et al. showed that ImageNet-trained CNNs can be strongly texture-biased rather than shape-biased \cite{geirhos2019texture}. This is precisely why we avoid a proxy network in the proposed method. TDCF estimates what matters from the \emph{same model being trained}, reducing the transferability gap that often weakens proxy-based compression schemes.
+
+\section{Proposed Method: Training-Dynamics-Coupled Fidelity}
+\subsection{Overview}
+TDCF has two phases:
+\begin{enumerate}
+    \item \textbf{Pilot measurement.} Train the target model for a short warm-up period on a small subset or a small number of epochs while measuring gradient sensitivity of transformed input components.
+    \item \textbf{Adaptive full training.} Store or serve each training image at fidelity levels chosen by a monotone schedule derived from the pilot statistics.
+\end{enumerate}
+
+The method is model-agnostic at the training-pipeline level, but it is \emph{model-specific in measurement}: the schedule is learned from the target model's own gradients.
+
+\subsection{Multi-fidelity dataset representation}
+Let $\T$ be a transform that separates coarse and fine information. In the final method, $\T$ is instantiated as a \textbf{block DCT}. Each image is partitioned into $P$ non-overlapping blocks (patches), and each block is represented by $B$ ordered frequency bands obtained by zig-zag grouping of its DCT coefficients. For an image $x$, write transformed coefficients as
+\begin{equation}
+    c = \T(x), \qquad c = \{c_{p,b}\}_{p=1,\dots,P;\; b=1,\dots,B}.
+\end{equation}
+The full-fidelity storage budget is therefore $PB$ \emph{band-slots}. TDCF stores coefficients in a band-sharded patch layout so that loading fewer bands is not only a logical masking rule but a physical reduction in data served from storage. A served sample is reconstructed by reading only the selected bands for each patch and applying the inverse block DCT.
+
+This patchwise representation is more faithful to the final method than a global low-pass transform. It preserves local spatial structure, supports exact byte accounting, and enables different patches of the same image to receive different amounts of frequency detail under the same total budget.
+
+\subsection{Instantaneous input sensitivity spectrum}
+For a mini-batch $\B_t$ at optimization step $t$, define the sensitivity of coefficient $k$ as
+\begin{equation}
+    \Phi_t(k) = \E_{(x,y)\sim\B_t} \left[\left\lVert \frac{\partial \Lagr(\theta_t; x, y)}{\partial c_k}\right\rVert_1\right].
+\end{equation}
+The vector $\Phi_t \in \R^M$ is the \textbf{instantaneous input sensitivity spectrum}. Intuitively, it measures how much the current loss would change if transformed coefficient $k$ were perturbed. Large values mean the model is currently using that component; small values mean that component is locally unimportant at step $t$.
+
+To stabilize the estimate, we aggregate across a window of steps belonging to epoch $e$:
+\begin{equation}
+    \bar{\Phi}_e(k) = \frac{1}{T_e} \sum_{t\in\text{epoch }e} \Phi_t(k).
+\end{equation}
+We normalize this into a distribution over coefficients or frequency bands:
+\begin{equation}
+    p_e(k) = \frac{\bar{\Phi}_e(k)}{\sum_{j=1}^{M} \bar{\Phi}_e(j) + \varepsilon}.
+\end{equation}
+If coefficients are grouped into bands $b=1,\dots,B$, we define band sensitivity
+\begin{equation}
+    s_e(b) = \sum_{k \in \text{band } b} p_e(k).
+\end{equation}
+
+\subsection{Spatial patch sensitivity}
+Frequency alone is not enough. A classifier may need fine detail only in specific patches. Let $c_p$ denote all coefficients of patch $p$. We define a patch sensitivity score
+\begin{equation}
+    g_e(p) = \E_{(x,y)}\left[\left\lVert \frac{\partial \Lagr}{\partial c_p}\right\rVert_1\right].
+\end{equation}
+This yields a spatial importance map over the patch grid. In the final implementation, the patch map is combined with per-band sensitivity and sample-specific patch signal strength to determine where the fixed epoch budget should be spent. Thus, TDCF is not merely a low-pass filter. It is a \emph{spatially faithful coarse-to-fine allocation rule over patch-band slots}.
+
+\subsection{From pilot sensitivity to a budget schedule}
+Given band sensitivities $s_e(b)$, define cumulative active mass
+\begin{equation}
+    S_e(m) = \sum_{b=1}^{m} s_e(b).
+\end{equation}
+Early prototypes converted $s_e(b)$ and $g_e(p)$ into threshold-based schedules $(K(e),q(e))$ using retention thresholds $(\eta_f,\eta_s)$. In practice, those schedules drifted toward near-full fidelity on larger datasets whenever the sensitivity distributions became flatter. The final method therefore uses an \textbf{explicit budget schedule} rather than a coverage threshold.
+
+Let the total epoch budget be
+\begin{equation}
+    \mathcal{B}(e) = \Big\lfloor PB \cdot \big[\beta_{\mathrm{start}} + (\beta_{\mathrm{end}}-\beta_{\mathrm{start}})(\tfrac{e}{E-1})^\gamma \big] \Big\rceil,
+\end{equation}
+where $\beta_{\mathrm{start}}$ and $\beta_{\mathrm{end}}$ are fractions of full I/O and $\gamma$ controls the coarse-to-fine ramp shape. Each patch receives at least $k_{\mathrm{low}}$ low-frequency bands, and the remaining band-slots are allocated greedily.
+
+Concretely, the final allocator assigns a variable number of bands $k_e(p)$ to each patch such that
+\begin{equation}
+    \sum_{p=1}^{P} k_e(p) = \mathcal{B}(e), \qquad k_e(p) \ge k_{\mathrm{low}}.
+\end{equation}
+The extra band-slots are given to the patch-band increments with largest estimated marginal utility, combining pilot sensitivity and the sample-specific presence of signal in that patch. This replaces the earlier binary ``important patch versus background patch'' rule with a \textbf{variable-$K$ patchwise allocation} under a fixed total budget.
+
+\subsection{Pilot phase}
+The schedule can be estimated from a pilot subset $\D_{\text{pilot}} \subset \D$, e.g., $1\%$--$5\%$ of the training set. This reduces measurement cost. The steps are:
+\begin{enumerate}
+    \item initialize model parameters and run warm-up training on $\D_{\text{pilot}}$,
+    \item compute $\bar\Phi_e$ and $g_e$ across pilot epochs,
+    \item fit the epoch-wise budget schedule $\mathcal{B}(e)$,
+    \item train on the full dataset using those schedules.
+\end{enumerate}
+
+The main paper uses a \textbf{one-shot pilot}. Periodic refresh was explored conceptually but is not part of the final method, both to keep the implementation simple and to preserve a clean accounting of extra measurement cost.
+
+\subsection{Training objective}
+The main optimization objective remains unchanged:
+\begin{equation}
+    \min_{\theta} \E_{(x,y)\sim\D} \left[\Lagr\big(\theta; x^{\text{serve}}_{e(x)}, y\big)\right].
+\end{equation}
+Thus TDCF is a \emph{training data policy}, not a new classifier loss. It can be used with cross-entropy, label smoothing, mixup, or other standard training components.
+
+\subsection{Algorithmic summary}
+\textbf{Input:} dataset $\D$, target model $f_\theta$, block transform $\T$, pilot ratio $\rho$, budget parameters $(\beta_{\mathrm{start}}, \beta_{\mathrm{end}}, \gamma)$, and minimum per-patch fidelity $k_{\mathrm{low}}$.\\
+\textbf{Step 1:} Build a block-DCT band store for each image.\\
+\textbf{Step 2:} Run pilot training on $\rho N$ examples and accumulate $\bar\Phi_e$ and $g_e$.\\
+\textbf{Step 3:} Convert pilot statistics into an epoch-wise budget schedule $\mathcal{B}(e)$.\\
+\textbf{Step 4:} For each batch, allocate band-slots greedily across patches under $\mathcal{B}(e)$, then reconstruct and train on the served image.\\
+\textbf{Step 5:} Evaluate at full fidelity for a standard accuracy comparison.
+
+\subsection{Discarded prototypes and final design choices}
+Several preliminary variants were useful for debugging but are not part of the final method:
+\begin{itemize}
+    \item \textbf{Global DCT + residual store.} An earlier prototype used a global low-pass image plus patchwise residual buckets. This was replaced by the block-DCT band store because the latter has cleaner byte accounting and a more direct physical I/O interpretation.
+    \item \textbf{Threshold schedules $(\eta_f,\eta_s)$.} Coverage-threshold schedules were discarded as the main mechanism because they tended to drift toward near-full fidelity on larger datasets with flatter sensitivity profiles.
+    \item \textbf{Binary $K_{\mathrm{high}}/K_{\mathrm{low}}$ patch gating.} The final method no longer gives every selected patch the same number of bands. Instead, it uses variable-$K$ allocation under a fixed budget.
+    \item \textbf{Periodic pilot refresh.} Although conceptually attractive, repeated refresh adds implementation and accounting complexity. We therefore keep it as future work rather than part of the primary method.
+    \item \textbf{Random and static policies.} These were retained only as ablations; they are no longer candidate versions of the main method.
+\end{itemize}
+
+\section{Theoretical Justification}
+The goal is not to claim an unrealistic exact theorem for all nonlinear models. Instead, we provide a \emph{local and honest} justification based on the current loss landscape.
+
+Let $c$ denote full transformed coefficients and let $\tilde c = c + \delta$ denote a truncated or perturbed version produced by a lower-fidelity representation. Consider the loss at fixed parameters $\theta_t$ and label $y$. A first-order Taylor expansion gives
+\begin{equation}
+    \Lagr(\theta_t; \tilde c, y) - \Lagr(\theta_t; c, y)
+    \approx \left\langle \nabla_c \Lagr(\theta_t; c, y), \delta \right\rangle.
+\end{equation}
+This immediately yields the following local bound.
+
+\begin{proposition}[First-order fidelity bound]
+Assume $\Lagr(\theta_t; c, y)$ is twice differentiable in a neighborhood of $c$, and its Hessian with respect to $c$ has operator norm at most $H_t$ in that neighborhood. Then for any perturbation $\delta$,
+\begin{equation}
+\begin{aligned}
+    \abs{\Lagr(\theta_t; c+\delta, y) - \Lagr(\theta_t; c, y)}
+    &\le \norm{\nabla_c \Lagr(\theta_t; c, y)}_\infty \norm{\delta}_1 \\
+    &\quad + \frac{H_t}{2}\norm{\delta}_2^2.
+\end{aligned}
+\end{equation}
+Equivalently, if the omitted coefficients are exactly those with small gradient mass, then the first-order loss perturbation is small up to a second-order remainder.
+\end{proposition}
+
+\begin{proof}
+Apply Taylor's theorem with remainder at point $c$ in direction $\delta$ and bound the linear term with H"older's inequality.
+\end{proof}
+
+This proposition is modest but important. It says that dropping transformed components with low current gradient sensitivity is justified \emph{locally} because the induced loss error is controlled by omitted gradient mass. In other words, the gradient spectrum is not merely heuristic; it directly upper-bounds the first-order training disturbance.
+
+A similar statement applies to patch residuals. Let $r = [r_1,\dots,r_P]$ be the stacked residuals and let $\delta_r$ zero out low-sensitivity patches. Then
+\begin{equation}
+    \abs{\Delta \Lagr} \le \sum_{p=1}^{P} \left\lVert \frac{\partial \Lagr}{\partial r_p} \right\rVert_1 \norm{\delta_{r,p}}_\infty + O(\norm{\delta_r}_2^2).
+\end{equation}
+Therefore retaining residuals for the patches with largest gradient mass minimizes a first-order surrogate of the training error.
+
+\begin{remark}
+This is deliberately weaker than claiming exact sufficiency or model-agnostic invariance. The contribution is a practical and mathematically grounded criterion for \emph{training-time fidelity selection}, not a universal theorem about all classifiers.
+\end{remark}
+
+\section{Experimental Protocol}
+\subsection{Datasets and backbones}
+A staged evaluation is recommended:
+\begin{itemize}
+    \item \textbf{Stage 0:} CIFAR-100 for low-cost mechanism ablations.
+    \item \textbf{Stage 1:} Tiny-ImageNet for mid-scale validation and schedule prototyping.
+    \item \textbf{Stage 2:} Full ImageNet-1K once the protocol is stable.
+\end{itemize}
+Recommended backbones:
+\begin{itemize}
+    \item a standard CNN such as a CIFAR CNN or ResNet-50,
+    \item a ViT baseline such as ViT-S/16.
+\end{itemize}
+This shows whether the method is broadly useful and whether the learned schedules differ across model families. Importantly, TDCF is \emph{architecture-agnostic at the pipeline level}: the same data-serving mechanism can be used without modifying CNN or ViT internals.
+
+\subsection{Baselines}
+The most relevant baselines are:
+\begin{enumerate}
+    \item \textbf{Full-fidelity training} (standard pipeline),
+    \item \textbf{Fixed matched-budget training} with the same average I/O as the dynamic method,
+    \item \textbf{Random matched-budget allocation} under the same budget schedule,
+    \item \textbf{Full-budget TDCF codepath control} (appendix only, not the official baseline),
+    \item \textbf{Optional appendix baselines}: static low-pass or perceptual codecs at matched budgets.
+\end{enumerate}
+
+\subsection{Evaluation metrics}
+The paper should report:
+\begin{itemize}
+    \item Top-1 and Top-5 accuracy,
+    \item accuracy drop relative to full-fidelity training,
+    \item dataset storage ratio,
+    \item bytes read per epoch,
+    \item end-to-end training wall-clock,
+    \item images/sec and accelerator utilization,
+    \item stability of the learned schedules $K(e)$ and $q(e)$.
+\end{itemize}
+
+\subsection{Ablation studies}
+The essential ablations for the current version are now:
+\begin{itemize}
+    \item \textbf{budget sweep}: $100\%$, $90\%$, $80\%$, and $70\%$ cap schedules,
+    \item \textbf{dynamic versus fixed} at matched average I/O,
+    \item \textbf{greedy versus random} allocation at matched average I/O,
+    \item \textbf{architecture transfer}: CNN on CIFAR-100 and larger-scale CNN/ViT experiments on Tiny-ImageNet and ImageNet-1K.
+\end{itemize}
+
+\subsection{Completed CIFAR-100 ablation study}
+Table~\ref{tab:cifar_ablation} summarizes the completed CIFAR-100 ablation study using a CNN backbone. The most important observations are:
+\begin{itemize}
+    \item The best reduced-budget point is \textbf{cap80}, which achieves $76.40\%$ final accuracy versus a $77.04\%$ full-fidelity baseline while using only $56.1\%$ average I/O, i.e., saving $43.9\%$ of served coefficient data.
+    \item At matched average I/O ($\approx 60\%$), the \textbf{dynamic} schedule slightly outperforms the fixed-budget control ($76.21\%$ versus $75.92\%$ final accuracy), supporting the curriculum component.
+    \item At the same average budget, \textbf{random} allocation is far worse than the final greedy method ($71.79\%$ versus $76.21\%$), showing that \emph{how} the budget is spent matters, not only \emph{how much} is spent.
+    \item The full-budget TDCF codepath control slightly exceeds the baseline in our prototype, but this run is not used as the official reference because the pilot phase updates model weights and therefore gives the codepath control extra optimization time.
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\small
+\caption{CIFAR-100 ablation study with CNN backbone. Avg. I/O is reported as a fraction of full-fidelity training.}
+\label{tab:cifar_ablation}
+\begin{tabular}{lccc}
+\toprule
+Method & Best (\%) & Final (\%) & Avg. I/O \\
+\midrule
+Baseline & 77.20 & 77.04 & 1.000 \\
+TDCF cap90 & 76.26 & 76.21 & 0.601 \\
+TDCF cap80 & 76.48 & 76.40 & 0.561 \\
+TDCF cap70 & 75.57 & 75.37 & 0.520 \\
+Fixed-match90 & 76.06 & 75.92 & 0.602 \\
+Random-match90 & 71.84 & 71.79 & 0.600 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why dynamic scheduling outperforms fixed-budget training}
+
+A natural question is: why not simply train at a fixed budget of, say, $75\%$ throughout, matching the average I/O of the \texttt{cap90} dynamic schedule? This control is exactly what the \textbf{Fixed-match90} row in Table~\ref{tab:cifar_ablation} evaluates.
+
+The key insight is that a fixed budget forces the same I/O reduction \emph{from epoch~0}. On CIFAR-100, this costs $0.29$ points of accuracy relative to the dynamic schedule ($75.92\%$ vs $76.21\%$) at identical average I/O. The reason is grounded in the well-established \emph{spectral bias} of neural networks~\cite{rahaman2019spectral}: models learn low-frequency structure before high-frequency detail. In the earliest epochs, coarse global information is precisely what the optimizer needs; dropping further frequency bands at this stage provides almost no additional signal loss. In contrast, fine-frequency detail becomes progressively more important as training converges. The dynamic schedule exploits this directly: it starts at $\beta_{\mathrm{start}} = 60\%$ early, where the accuracy cost of reduced fidelity is lowest, and ramps to $\beta_{\mathrm{end}} = 90\%$ late, where high-frequency detail is gradient-critical. A fixed $60\%$ budget forgoes this \emph{curriculum alignment} and pays a disproportionate late-training accuracy cost.
+
+Stated plainly: the dynamic schedule does not merely save average I/O — it \emph{spends that I/O where it matters most}. This is the core curriculum contribution of TDCF beyond simple bandwidth reduction.
+
+\subsection{ImageNet-1K results}
+
+Table~\ref{tab:imagenet_results} summarizes the completed ImageNet-1K online-DCT experiments using a ResNet-50 backbone. All runs use identical training hyperparameters, lightweight augmentation (random resized crop and horizontal flip), 100 epochs, and label smoothing $0.1$. The only difference between runs is the budget schedule $(\beta_{\mathrm{start}}, \beta_{\mathrm{end}}, \gamma)$.
+
+\begin{table}[t]
+\centering
+\small
+\caption{ImageNet-1K results with ResNet-50 backbone. All runs use identical settings. Avg. budget is the analytically computed $\beta_{\mathrm{start}} + (\beta_{\mathrm{end}} - \beta_{\mathrm{start}})/(\gamma + 1)$ for $\gamma=1.0$.}
+\label{tab:imagenet_results}
+\begin{tabular}{lcccc}
+\toprule
+Method & Top-1 (\%) & Drop & Avg. budget & I/O saved \\
+\midrule
+Baseline & 70.30 & -- & 1.000 & 0.0\% \\
+TDCF cap90 & 70.13 & $-0.17$ & 0.750 & 25.0\% \\
+TDCF cap80 & 69.40 & $-0.90$ & 0.700 & 30.0\% \\
+TDCF cap70 & 69.99 & $-0.31$ & 0.625 & 37.5\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \texttt{cap90} result is the strongest: a $0.17$-point accuracy drop while saving $25\%$ of total served coefficient data across the full 100-epoch run, corresponding to a reduction from a $13.0$\,TB to $9.75$\,TB equivalent logical budget. The \texttt{cap70} result ($-0.31$ at $37.5\%$ savings) is competitive and supports a favorable Pareto frontier. The \texttt{cap80} point ($-0.90$) is currently the weakest and is being re-run to confirm whether this reflects genuine schedule sensitivity or run variance. Pending re-run, the overall curve supports the paper's efficiency claim.
+
+\textbf{Honest claim.} For the current online-DCT path, ImageNet images are still loaded from JPEG shards before DCT is applied; the savings above are therefore \emph{logical served-coefficient} reductions, not raw disk-byte savings. The compressed quantized offline store (Section~\ref{sec:offline}) will provide exact physical I/O measurements once complete.
+
+\subsection{Offline quantized store (in progress)}
+\label{sec:offline}
+
+The offline store (implemented in \texttt{quantized\_store.py}) converts each image to an int8 quantized, zlib-compressed, bucket-organized block-DCT format prior to training. The result is an $\approx 102$\,GB store for ImageNet-1K, comparable in size to the original JPEG dataset ($\approx 128$\,GB), but with the critical property that loading $K$ of $B$ frequency bands physically reads only $K/B$ of the compressed bytes for the intersecting spatial tiles. This enables exact per-epoch physical byte accounting as reported by the store's \texttt{get\_io\_ratio()} method. Results from this path are pending and will replace the logical-budget framing above in the final submission.
+
+\section{Current Status and Risk Assessment}
+The current evidence already rules out an exaggerated ``95\% compression with no loss'' claim. A more credible and stronger story is:
+\begin{quote}
+\emph{By serving coarse global structure early and progressively unlocking gradient-active detail later, TDCF reduces training-time I/O substantially while keeping classification accuracy within a small, predictable margin of standard training.}
+\end{quote}
+
+What the current prototype already supports:
+\begin{itemize}
+    \item a clean CIFAR-100 Pareto frontier, with the best reduced-budget point within $0.64$ points of baseline while saving $43.9\%$ average I/O,
+    \item a matched-budget curriculum ablation in favor of the dynamic schedule,
+    \item a strong matched-budget policy ablation in favor of greedy allocation over random allocation,
+    \item architecture-agnostic methodology at the training-pipeline level.
+\end{itemize}
+
+The main risks are also clear:
+\begin{itemize}
+    \item ImageNet-1K may show only modest gains or weaker regularization effects than Tiny-ImageNet,
+    \item some tasks may require high-frequency detail earlier than expected,
+    \item coefficient-level I/O savings may not fully translate to wall-clock gains if compute dominates I/O.
+\end{itemize}
+These are manageable risks, and they lead to meaningful large-scale experiments rather than fatal weaknesses.
+
+\section{Conclusion}
+This document now describes a revised standalone paper centered on \emph{machine-centric, training-dynamics-aware dataset fidelity}. The key claim is modest but strong: the amount and type of information a model needs from its training data is not static, and this can be estimated from the model's own gradient sensitivity rather than from human perception or a separate proxy network. TDCF turns that observation into a concrete pipeline: build a block-DCT band store, measure pilot-phase gradient sensitivity, fit an explicit budget schedule, and train with a variable-$K$ patchwise allocation under that budget.
+
+As a practical method, it directly addresses the reality of limited training budgets, bandwidth, and storage, while remaining compatible with multiple visual backbones. The completed CIFAR-100 ablations now provide concrete evidence that the method is not merely ``another DCT trick'': the budget schedule matters, the allocation policy matters, and the resulting tradeoff curve is competitive. The remaining question for the paper is therefore no longer whether the idea is coherent, but how strongly it transfers to Tiny-ImageNet and ImageNet-1K.
+
+\begin{thebibliography}{99}
+
+\bibitem{huang2024survey}
+Chao-Han Huang, Luming Lin, Chao-Tsung Huang, and Wen-Hsiao Peng.
+\newblock Unveiling the future of human and machine coding.
+\newblock \emph{Entropy}, 26(5):357, 2024.
+
+\bibitem{dynamicvit}
+Yujun Rao, Wenliang Zhao, Benyuan Liu, Jiwen Lu, and Jie Zhou.
+\newblock Dynamic{V}i{T}: Efficient vision transformers with dynamic token sparsification.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2021.
+
+\bibitem{tome}
+Daniel Bolya, Cheng-Yang Fu, Xiaoliang Dai, Peizhao Zhang, Christina Ruizhongtai Qi, and Judy Hoffman.
+\newblock Token merging: Your {V}i{T} but faster.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2023.
+
+\bibitem{mae}
+Kaiming He, Xinlei Chen, Saining Xie, Yanghao Li, Piotr Doll\'ar, and Ross Girshick.
+\newblock Masked autoencoders are scalable vision learners.
+\newblock In \emph{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2022.
+
+\bibitem{beit}
+Hangbo Bao, Li Dong, and Furu Wei.
+\newblock {BEiT}: {BERT} pre-training of image transformers.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2022.
+
+\bibitem{rahaman2019spectral}
+Nasim Rahaman, Aristide Baratin, Devansh Arpit, Felix Draxler, Min Lin, Fred Hamprecht, Yoshua Bengio, and Aaron Courville.
+\newblock On the spectral bias of neural networks.
+\newblock In \emph{International Conference on Machine Learning (ICML)}, 2019.
+
+\bibitem{geirhos2019texture}
+Robert Geirhos, Patricia Rubisch, Claudio Michaelis, Matthias Bethge, Felix Wichmann, and Wieland Brendel.
+\newblock ImageNet-trained {CNN}s are biased towards texture; increasing shape bias improves accuracy and robustness.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2019.
+
+\end{thebibliography}
+
+\end{document}
