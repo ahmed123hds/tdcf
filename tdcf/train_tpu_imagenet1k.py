@@ -8,6 +8,7 @@ import traceback
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch_xla.distributed.xla_backend
 import torchvision.models as tv_models
@@ -77,6 +78,23 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--label_smooth", type=float, default=0.1)
     p.add_argument("--amp_bf16", action="store_true")
+    p.add_argument("--auto_augment", choices=["none", "randaugment", "trivialaugment"],
+                   default="none",
+                   help="Optional training-only PIL augmentation for stronger ImageNet recipes.")
+    p.add_argument("--random_erase", type=float, default=0.0,
+                   help="Probability for RandomErasing after ToTensor.")
+    p.add_argument("--mixup_alpha", type=float, default=0.0,
+                   help="Mixup alpha. Enabled when > 0.")
+    p.add_argument("--cutmix_alpha", type=float, default=0.0,
+                   help="CutMix alpha. Enabled when > 0. Off by default to avoid TPU graph churn.")
+    p.add_argument("--cutmix_prob", type=float, default=0.0,
+                   help="Probability of using CutMix instead of Mixup when both are enabled.")
+    p.add_argument("--model_ema", action="store_true",
+                   help="Track an EMA copy of model weights and evaluate/save with EMA weights.")
+    p.add_argument("--model_ema_decay", type=float, default=0.9999)
+    p.add_argument("--model_ema_steps", type=int, default=32)
+    p.add_argument("--val_resize_size", type=int, default=None,
+                   help="Validation resize before center crop. Defaults to round(img_size * 1.14).")
 
     p.add_argument("--eta_f", type=float, default=0.9)
     p.add_argument("--eta_s", type=float, default=0.85)
@@ -112,6 +130,51 @@ def build_model(args, device: torch.device):
     return nn.Sequential(InputNormalize(IMAGENET_MEAN, IMAGENET_STD), backbone).to(device)
 
 
+class ModelEma:
+    """Small TPU-friendly EMA helper for model parameters and buffers."""
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = float(decay)
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+        }
+
+    def update(self, model: nn.Module):
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                v_detached = v.detach()
+                if torch.is_floating_point(v_detached):
+                    self.shadow[k].mul_(self.decay).add_(v_detached, alpha=1.0 - self.decay)
+                else:
+                    self.shadow[k].copy_(v_detached)
+
+    def state_dict(self):
+        return {k: v.detach().clone() for k, v in self.shadow.items()}
+
+    def load_state_dict(self, state):
+        loaded = {}
+        for k, v in state.items():
+            target = self.shadow.get(k)
+            if target is not None:
+                loaded[k] = v.detach().to(device=target.device, dtype=target.dtype).clone()
+            else:
+                loaded[k] = v.detach().clone()
+        self.shadow = loaded
+
+    def apply_to(self, model: nn.Module):
+        backup = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+        }
+        model.load_state_dict(self.shadow, strict=True)
+        return backup
+
+    @staticmethod
+    def restore(model: nn.Module, backup):
+        model.load_state_dict(backup, strict=True)
+
+
 def make_optimizer(args, model, lr: float):
     if args.backbone == "vit_b16":
         return optim.AdamW(
@@ -145,16 +208,34 @@ def identity_label(label):
     return int(label)
 
 
+def _build_train_transform(args):
+    transforms = [
+        T.RandomResizedCrop(args.img_size),
+        T.RandomHorizontalFlip(),
+    ]
+
+    if args.auto_augment == "randaugment":
+        if not hasattr(T, "RandAugment"):
+            raise RuntimeError("torchvision.transforms.RandAugment is unavailable in this environment.")
+        transforms.append(T.RandAugment())
+    elif args.auto_augment == "trivialaugment":
+        if not hasattr(T, "TrivialAugmentWide"):
+            raise RuntimeError("torchvision.transforms.TrivialAugmentWide is unavailable in this environment.")
+        transforms.append(T.TrivialAugmentWide())
+
+    transforms.append(T.ToTensor())
+    if args.random_erase > 0:
+        transforms.append(T.RandomErasing(p=args.random_erase, value="random"))
+    return T.Compose(transforms)
+
+
 def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
     if is_training:
-        transform = T.Compose([
-            T.RandomResizedCrop(args.img_size),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-        ])
+        transform = _build_train_transform(args)
     else:
+        val_resize_size = args.val_resize_size or int(args.img_size * 1.14)
         transform = T.Compose([
-            T.Resize(int(args.img_size * 1.14)),
+            T.Resize(val_resize_size),
             T.CenterCrop(args.img_size),
             T.ToTensor(),
         ])
@@ -197,6 +278,72 @@ def build_wds_loader(shards_url: str, batch_size: int, args, is_training: bool):
         persistent_workers=False,
         prefetch_factor=2 if num_workers > 0 else None,
     )
+
+
+def smooth_one_hot(labels: torch.Tensor, num_classes: int, smoothing: float) -> torch.Tensor:
+    labels = labels.long()
+    off_value = smoothing / float(num_classes)
+    on_value = 1.0 - smoothing + off_value
+    target = torch.full(
+        (labels.size(0), num_classes),
+        off_value,
+        device=labels.device,
+        dtype=torch.float32,
+    )
+    return target.scatter_(1, labels.view(-1, 1), on_value)
+
+
+def soft_target_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+
+
+def compute_loss(logits: torch.Tensor, target: torch.Tensor, label_smooth: float) -> torch.Tensor:
+    if target.ndim == 2:
+        return soft_target_cross_entropy(logits, target)
+    return F.cross_entropy(logits, target.long(), label_smoothing=label_smooth)
+
+
+def _rand_bbox(height: int, width: int, lam: float):
+    cut_ratio = math.sqrt(max(0.0, 1.0 - lam))
+    cut_h = int(height * cut_ratio)
+    cut_w = int(width * cut_ratio)
+    cy = random.randint(0, height - 1)
+    cx = random.randint(0, width - 1)
+    y1 = max(cy - cut_h // 2, 0)
+    y2 = min(cy + cut_h // 2, height)
+    x1 = max(cx - cut_w // 2, 0)
+    x2 = min(cx + cut_w // 2, width)
+    return y1, y2, x1, x2
+
+
+def apply_batch_mixing(images: torch.Tensor, labels: torch.Tensor, args):
+    """
+    Apply Mixup/CutMix after the fidelity path. This keeps the served-input
+    budget comparable between baseline and TDCF while giving both the same
+    regularized supervision.
+    """
+    use_mixup = args.mixup_alpha > 0
+    use_cutmix = args.cutmix_alpha > 0 and random.random() < args.cutmix_prob
+    if not use_mixup and not use_cutmix:
+        return images, labels
+
+    alpha = args.cutmix_alpha if use_cutmix else args.mixup_alpha
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(images.size(0), device=images.device)
+    y1 = smooth_one_hot(labels, args.n_classes, args.label_smooth)
+    y2 = smooth_one_hot(labels[perm], args.n_classes, args.label_smooth)
+
+    if use_cutmix:
+        _, _, height, width = images.shape
+        by1, by2, bx1, bx2 = _rand_bbox(height, width, lam)
+        mixed = images.clone()
+        mixed[:, :, by1:by2, bx1:bx2] = images[perm, :, by1:by2, bx1:bx2]
+        box_area = float((by2 - by1) * (bx2 - bx1))
+        lam = 1.0 - box_area / float(height * width)
+        return mixed, y1 * lam + y2 * (1.0 - lam)
+
+    mixed = images * lam + images[perm] * (1.0 - lam)
+    return mixed, y1 * lam + y2 * (1.0 - lam)
 
 
 def make_epoch_accumulators(device: torch.device):
@@ -462,7 +609,6 @@ def train_process(index, args):
         print("=" * 72)
 
     model = build_model(args, device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
     pilot_opt = make_optimizer(args, model, scaled_pilot_lr)
     estimator = BlockSensitivityEstimator(args.block_size, nph, npw, args.num_bands, device=device)
 
@@ -498,11 +644,12 @@ def train_process(index, args):
                     labels = labels.long()
                     coeffs = block_dct2d(images, block_size=args.block_size).detach().requires_grad_(True)
                     x = block_idct2d(coeffs, nph, npw)
+                    x, train_target = apply_batch_mixing(x, labels, args)
 
                     pilot_opt.zero_grad(set_to_none=True)
                     with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                         logits = model(x)
-                        loss = criterion(logits, labels)
+                        loss = compute_loss(logits, train_target, args.label_smooth)
                     loss.backward()
 
                     if coeffs.grad is not None:
@@ -554,6 +701,8 @@ def train_process(index, args):
     # Fresh optimizer after pilot.
     opt = make_optimizer(args, model, scaled_lr)
     sched_lr = make_scheduler(args, opt, args.epochs)
+    model_ema = ModelEma(model, args.model_ema_decay) if args.model_ema else None
+    optimizer_step_count = 0
 
     best_acc = 0.0
     start_epoch = 0
@@ -568,6 +717,9 @@ def train_process(index, args):
         model.load_state_dict(ckpt_data["state_dict"])
         opt.load_state_dict(ckpt_data["optimizer"])
         sched_lr.load_state_dict(ckpt_data["scheduler"])
+        if model_ema is not None and "ema_state" in ckpt_data:
+            model_ema.load_state_dict(ckpt_data["ema_state"])
+        optimizer_step_count = ckpt_data.get("optimizer_step_count", 0)
         start_epoch = ckpt_data["epoch"]   # already-completed epochs
         best_acc = ckpt_data.get("best_acc", 0.0)
         if xm.is_master_ordinal():
@@ -645,16 +797,20 @@ def train_process(index, args):
                     )
                 coeffs_masked = apply_k_allocation(coeffs, k_alloc, args.num_bands)
                 x = block_idct2d(coeffs_masked, nph, npw)
+            x, train_target = apply_batch_mixing(x, labels, args)
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                 logits = model(x)
-                loss = criterion(logits, labels)
+                loss = compute_loss(logits, train_target, args.label_smooth)
             loss.backward()
             xm.reduce_gradients(opt)
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             xm.optimizer_step(opt)
+            optimizer_step_count += 1
+            if model_ema is not None and optimizer_step_count % max(1, args.model_ema_steps) == 0:
+                model_ema.update(model)
 
             batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
             tr_loss_t.add_(loss.detach() * batch_n)
@@ -696,6 +852,9 @@ def train_process(index, args):
         train_time = time.time() - train_start_time
 
         # Validate at full fidelity
+        ema_backup = None
+        if model_ema is not None:
+            ema_backup = model_ema.apply_to(model)
         val_loader = build_wds_loader(args.val_shards, args.eval_batch_size, args, False)
         pl_val = pl.ParallelLoader(val_loader, [device])
         para_val = pl_val.per_device_loader(device)
@@ -715,7 +874,7 @@ def train_process(index, args):
                 labels = labels.long()
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(images)
-                    loss = criterion(logits, labels)
+                    loss = compute_loss(logits, labels, args.label_smooth)
                 batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
                 va_loss_t.add_(loss * batch_n)
                 va_corr_t.add_((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
@@ -732,6 +891,8 @@ def train_process(index, args):
         # Close the validation ParallelLoader to release background threads
         del para_val
         pl_val.close()
+        if model_ema is not None and ema_backup is not None:
+            ModelEma.restore(model, ema_backup)
 
         va_n_total = xm.mesh_reduce(f"va_n_{ep}", va_n_accum, sum)
         va_corr_total = xm.mesh_reduce(f"va_corr_{ep}", va_corr_accum, sum)
@@ -779,7 +940,10 @@ def train_process(index, args):
             "best_acc": best_acc,
             "val_acc": va_acc,
             "args": vars(args),
+            "optimizer_step_count": optimizer_step_count,
         }
+        if model_ema is not None:
+            ckpt["ema_state"] = model_ema.state_dict()
         xm.save(ckpt, os.path.join(args.save_dir, "latest.pt"))
         if (ep + 1) % args.save_every == 0:
             xm.save(ckpt, os.path.join(args.save_dir, f"epoch_{ep+1:03d}.pt"))
