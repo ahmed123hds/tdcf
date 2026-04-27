@@ -6,6 +6,8 @@ import argparse
 import json
 import math
 import os
+import time
+import datetime
 import zlib
 from collections import defaultdict
 from typing import Dict, List
@@ -145,12 +147,15 @@ def calibrate(args, device):
 
 def scan(args):
     shapes, labels = [], []
+    start_time = time.time()
     for idx, (img, label) in enumerate(build_loader(args), start=1):
         h, w = img.shape[-2:]
         shapes.append((h, w))
         labels.append(int(label))
         if idx % 10000 == 0:
-            print(f"[orig-quant] scan {idx} samples", flush=True)
+            elapsed = time.time() - start_time
+            rate = idx / elapsed
+            print(f"[orig-quant] scan {idx} samples ({rate:.1f} img/s)", flush=True)
         if args.max_samples > 0 and idx >= args.max_samples:
             break
     return np.asarray(shapes, dtype=np.int32), np.asarray(labels, dtype=np.int64)
@@ -326,6 +331,8 @@ def build_store(args):
         buckets.append(init_bucket(args, bid, key, ids, shapes, labels))
 
     local_counters = np.zeros(len(bucket_shapes), dtype=np.int64)
+    total_samples = len(labels)
+    start_time = time.time()
     for global_idx, (img, _label) in enumerate(build_loader(args)):
         if args.max_samples > 0 and global_idx >= args.max_samples:
             break
@@ -337,7 +344,11 @@ def build_store(args):
         if len(rt["pending_imgs"]) >= args.chunk_size:
             flush_bucket(args, buckets[bid], scales, device)
         if (global_idx + 1) % 10000 == 0:
-            print(f"[orig-quant] wrote {global_idx + 1} samples", flush=True)
+            elapsed = time.time() - start_time
+            rate = (global_idx + 1) / elapsed
+            rem_sec = (total_samples - (global_idx + 1)) / rate
+            eta = str(datetime.timedelta(seconds=int(rem_sec)))
+            print(f"[orig-quant] wrote {global_idx + 1}/{total_samples} samples ({rate:.1f} img/s) | ETA: {eta}", flush=True)
 
     for bucket in buckets:
         flush_bucket(args, bucket, scales, device)
