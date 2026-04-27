@@ -144,6 +144,7 @@ The current TPU runners for the online path are:
 bash tdcf/scripts/run_imagenet1k_cap90.sh
 bash tdcf/scripts/run_imagenet1k_cap80.sh
 bash tdcf/scripts/run_imagenet1k_cap70.sh
+bash tdcf/scripts/run_imagenet1k_cap60.sh
 bash tdcf/scripts/run_imagenet1k_cap100.sh
 ```
 
@@ -163,6 +164,29 @@ python3 scripts/eval_imagenet1k_checkpoint.py \
   --checkpoint ./results/imagenet1k_baseline_full_fixed/best.pt \
   --val_shards '/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
 ```
+
+### Quantized DCT precision search
+
+Before building a compressed physical coefficient store, test whether integer
+DCT coefficients preserve enough reconstruction quality:
+
+```bash
+bash tdcf/scripts/run_quantized_dct_precision.sh synthetic
+bash tdcf/scripts/run_quantized_dct_precision.sh cifar100
+```
+
+For an ImageNet WebDataset sample:
+
+```bash
+SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar' \
+NUM_SAMPLES=256 IMG_SIZE=224 BLOCK_SIZE=8 TARGET_PSNR=45 TARGET_SSIM=0.995 \
+bash tdcf/scripts/run_quantized_dct_precision.sh webdataset
+```
+
+The search tries compact `int8` coefficients first and falls back to `int16`
+only if needed. For each dtype it binary-searches the coarsest quantization
+scale that still passes the requested PSNR/SSIM/error thresholds. Reports are
+written as JSON and CSV under `./results/dct_quant_precision_*`.
 
 ## Notes on storage and I/O claims
 
