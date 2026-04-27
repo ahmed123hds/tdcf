@@ -188,6 +188,37 @@ only if needed. For each dtype it binary-searches the coarsest quantization
 scale that still passes the requested PSNR/SSIM/error thresholds. Reports are
 written as JSON and CSV under `./results/dct_quant_precision_*`.
 
+### Quantized ImageNet-1K physical store
+
+After the precision search passes on ImageNet samples, build the compressed
+fixed-view coefficient store:
+
+```bash
+bash tdcf/scripts/run_prepare_imagenet1k_quant_store.sh
+```
+
+By default this writes:
+
+```text
+/mnt/dataset_disk/imagenet1k_quant_dct_288/train
+/mnt/dataset_disk/imagenet1k_quant_dct_288/val
+```
+
+The store uses `288x288` fixed views, `8x8` block-DCT, int8 quantized
+coefficients, zlib-compressed tile/band chunks, and block-aligned random
+`224x224` crops during training. This path reports real compressed coefficient
+bytes read per epoch.
+
+Run the physical-I/O capped experiments with:
+
+```bash
+bash tdcf/scripts/run_imagenet1k_quant_store_cap100.sh
+bash tdcf/scripts/run_imagenet1k_quant_store_cap90.sh
+bash tdcf/scripts/run_imagenet1k_quant_store_cap80.sh
+bash tdcf/scripts/run_imagenet1k_quant_store_cap70.sh
+bash tdcf/scripts/run_imagenet1k_quant_store_cap60.sh
+```
+
 ## Notes on storage and I/O claims
 
 This repo currently supports two evaluation regimes.
