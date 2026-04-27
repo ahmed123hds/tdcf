@@ -52,7 +52,9 @@ python3 -m tdcf.prepare_imagenet1k_quantized_store \
     --calibration_samples "$CALIBRATION_SAMPLES" \
     --quant_multiplier "$QUANT_MULTIPLIER" \
     --compression_level "$COMPRESSION_LEVEL" \
-    --device "$DEVICE"
+    --device "$DEVICE" \
+    ${FORECAST_ONLY:+--forecast_only} \
+    ${SCAN_CACHE:+--scan_cache "$SCAN_CACHE"}
 
 echo "[prep-quant] Building val store at $OUT_ROOT/val"
 python3 -m tdcf.prepare_imagenet1k_quantized_store \
