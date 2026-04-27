@@ -205,9 +205,15 @@ By default this writes:
 ```
 
 The store keeps each image at its original spatial size, pads only to an `8x8`
-block grid, stores int8 quantized DCT coefficients in zlib-compressed tile/band
-chunks, and samples random crops in the original image coordinate system during
-training. This path reports real compressed coefficient bytes read per epoch.
+block grid inside a small number of area/aspect buckets, stores int8 quantized
+DCT coefficients in zlib-compressed tile/band chunks, and samples random crops
+in the original image coordinate system during training. This path reports real
+compressed coefficient bytes read per epoch. The default bucket count is `16`;
+you can sweep `8, 16, 32, 64` first with:
+
+```bash
+MAX_SAMPLES=20000 bash tdcf/scripts/run_prepare_imagenet1k_quant_store_sweep.sh
+```
 
 Run the physical-I/O capped experiments with:
 

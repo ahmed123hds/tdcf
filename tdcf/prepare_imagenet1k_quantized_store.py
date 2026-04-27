@@ -8,7 +8,7 @@ import math
 import os
 import zlib
 from collections import defaultdict
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -27,6 +27,8 @@ def parse_args():
     p.add_argument("--num_bands", type=int, default=16)
     p.add_argument("--tile_blocks", type=int, default=4)
     p.add_argument("--chunk_size", type=int, default=64)
+    p.add_argument("--bucket_count", type=int, default=16,
+                   help="Coarse area/aspect buckets. Use powers of two: 8, 16, 32, 64.")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -142,23 +144,62 @@ def calibrate(args, device):
 
 
 def scan(args):
-    shapes, labels, keys = [], [], []
+    shapes, labels = [], []
     for idx, (img, label) in enumerate(build_loader(args), start=1):
         h, w = img.shape[-2:]
         shapes.append((h, w))
         labels.append(int(label))
-        keys.append(bucket_key_from_shape(h, w, args.block_size))
         if idx % 10000 == 0:
-            print(f"[orig-quant] scan {idx} samples | buckets={len(set(keys))}", flush=True)
+            print(f"[orig-quant] scan {idx} samples", flush=True)
         if args.max_samples > 0 and idx >= args.max_samples:
             break
-    return np.asarray(shapes, dtype=np.int32), np.asarray(labels, dtype=np.int64), keys
+    return np.asarray(shapes, dtype=np.int32), np.asarray(labels, dtype=np.int64)
 
 
-def write_bucket(args, bucket_id, key, global_ids, shapes, labels, scales, device):
+def _bucket_factorization(bucket_count: int):
+    if bucket_count <= 0 or bucket_count & (bucket_count - 1):
+        raise ValueError("--bucket_count must be a power of two")
+    ratio_bins = min(8, max(2, int(round(math.sqrt(bucket_count)))))
+    while bucket_count % ratio_bins != 0:
+        ratio_bins //= 2
+    area_bins = bucket_count // ratio_bins
+    return area_bins, ratio_bins
+
+
+def assign_coarse_buckets(shapes: np.ndarray, block_size: int, bucket_count: int):
+    grids_h = np.ceil(shapes[:, 0] / block_size).astype(np.int32)
+    grids_w = np.ceil(shapes[:, 1] / block_size).astype(np.int32)
+    log_area = np.log2(np.maximum(grids_h * grids_w, 1))
+    log_ratio = np.log2(np.maximum(grids_h, 1) / np.maximum(grids_w, 1))
+    area_bins, ratio_bins = _bucket_factorization(bucket_count)
+
+    area_edges = np.quantile(log_area, np.linspace(0, 1, area_bins + 1)[1:-1])
+    ratio_edges = np.quantile(log_ratio, np.linspace(0, 1, ratio_bins + 1)[1:-1])
+    area_id = np.searchsorted(area_edges, log_area, side="right")
+    ratio_id = np.searchsorted(ratio_edges, log_ratio, side="right")
+    raw_ids = (area_id * ratio_bins + ratio_id).astype(np.int32)
+
+    unique_raw = sorted(np.unique(raw_ids).tolist())
+    remap = {raw: i for i, raw in enumerate(unique_raw)}
+    bucket_ids = np.asarray([remap[int(x)] for x in raw_ids], dtype=np.int32)
+
+    bucket_shapes = []
+    for bucket_id in range(len(unique_raw)):
+        ids = np.flatnonzero(bucket_ids == bucket_id)
+        bucket_shapes.append((int(grids_h[ids].max()), int(grids_w[ids].max())))
+    return bucket_ids, bucket_shapes, {
+        "requested_bucket_count": int(bucket_count),
+        "actual_bucket_count": int(len(bucket_shapes)),
+        "area_bins": int(area_bins),
+        "ratio_bins": int(ratio_bins),
+        "area_edges": area_edges.tolist(),
+        "ratio_edges": ratio_edges.tolist(),
+    }
+
+
+def init_bucket(args, bucket_id, key, global_ids, shapes, labels):
     nph, npw = key
     P = nph * npw
-    canvas_h, canvas_w = nph * args.block_size, npw * args.block_size
     total_coeffs = args.block_size * args.block_size
     band_size = total_coeffs // args.num_bands
     bounds = [b * band_size for b in range(args.num_bands + 1)]
@@ -178,84 +219,85 @@ def write_bucket(args, bucket_id, key, global_ids, shapes, labels, scales, devic
         shape=(len(global_ids), P),
     )
     band_files = [open(os.path.join(bucket_dir, f"band_{b:02d}.bin"), "wb") for b in range(args.num_bands)]
-    offsets, lengths, raw_lengths, chunk_sizes = [], [], [], []
-
-    id_to_local = {int(g): i for i, g in enumerate(global_ids)}
-    pending_imgs, pending_global = [], []
-    source = build_loader(args)
-    wanted = set(int(x) for x in global_ids.tolist())
-    seen = -1
-
-    def flush():
-        nonlocal pending_imgs, pending_global
-        if not pending_imgs:
-            return
-        B = len(pending_imgs)
-        batch = torch.zeros((B, 3, canvas_h, canvas_w), device=device)
-        for i, img in enumerate(pending_imgs):
-            batch[i, :, :img.shape[-2], :img.shape[-1]] = img.to(device)
-        coeffs = block_dct2d(batch, block_size=args.block_size)
-        flat = coeffs.reshape(B, P, 3, total_coeffs).detach().cpu().numpy()
-        zz_coeffs = flat[:, :, :, zz]
-        sig = np.abs(flat).mean(axis=(2, 3)).astype(np.float32)
-        local_pos = np.asarray([id_to_local[int(g)] for g in pending_global], dtype=np.int64)
-        patch_signal[local_pos] = sig
-
-        chunk_offsets = np.zeros((len(specs), args.num_bands), dtype=np.int64)
-        chunk_lengths = np.zeros((len(specs), args.num_bands), dtype=np.int32)
-        chunk_raw = np.zeros((len(specs), args.num_bands), dtype=np.int32)
-        for spec in specs:
-            tile_index = int(spec["tile_index"])
-            block_ids = np.asarray(spec["block_ids"], dtype=np.int64)
-            tile = zz_coeffs[:, block_ids]
-            for band in range(args.num_bands):
-                start, end = bounds[band], bounds[band + 1]
-                data = tile[:, :, :, start:end]
-                if scales.shape[0] == 1:
-                    q = np.rint(data / scales[0, band])
-                else:
-                    q = np.rint(data / scales[:, band].reshape(1, 1, 3, 1))
-                q = np.clip(q, -128, 127).astype(np.int8, copy=False)
-                raw = np.ascontiguousarray(q).tobytes()
-                payload = zlib.compress(raw, level=args.compression_level)
-                chunk_offsets[tile_index, band] = band_files[band].tell()
-                band_files[band].write(payload)
-                chunk_lengths[tile_index, band] = len(payload)
-                chunk_raw[tile_index, band] = len(raw)
-        offsets.append(chunk_offsets)
-        lengths.append(chunk_lengths)
-        raw_lengths.append(chunk_raw)
-        chunk_sizes.append(B)
-        pending_imgs, pending_global = [], []
-
-    for img, _label in source:
-        seen += 1
-        if seen not in wanted:
-            if args.max_samples > 0 and seen >= args.max_samples:
-                break
-            continue
-        pending_imgs.append(pad_to_block(img.float(), args.block_size))
-        pending_global.append(seen)
-        if len(pending_imgs) >= args.chunk_size:
-            flush()
-        if len(pending_global) + sum(chunk_sizes) >= len(global_ids):
-            pass
-    flush()
-    for f in band_files:
-        f.close()
-    patch_signal.flush()
-
-    np.save(os.path.join(bucket_dir, "offsets.npy"), np.stack(offsets))
-    np.save(os.path.join(bucket_dir, "lengths.npy"), np.stack(lengths))
-    np.save(os.path.join(bucket_dir, "raw_lengths.npy"), np.stack(raw_lengths))
-    np.save(os.path.join(bucket_dir, "chunk_sizes.npy"), np.asarray(chunk_sizes, dtype=np.int32))
     return {
         "bucket_id": int(bucket_id),
         "dir": f"bucket_{bucket_id:03d}",
         "nph": int(nph),
         "npw": int(npw),
         "num_samples": int(len(global_ids)),
+        "_runtime": {
+            "P": P,
+            "bounds": bounds,
+            "zz": zz,
+            "specs": specs,
+            "band_files": band_files,
+            "patch_signal": patch_signal,
+            "offsets": [],
+            "lengths": [],
+            "raw_lengths": [],
+            "chunk_sizes": [],
+            "pending_imgs": [],
+            "pending_local": [],
+        },
     }
+
+
+def flush_bucket(args, bucket, scales, device):
+    rt = bucket["_runtime"]
+    if not rt["pending_imgs"]:
+        return
+    B = len(rt["pending_imgs"])
+    canvas_h = bucket["nph"] * args.block_size
+    canvas_w = bucket["npw"] * args.block_size
+    total_coeffs = args.block_size * args.block_size
+    batch = torch.zeros((B, 3, canvas_h, canvas_w), device=device)
+    for i, img in enumerate(rt["pending_imgs"]):
+        batch[i, :, :img.shape[-2], :img.shape[-1]] = img.to(device)
+    coeffs = block_dct2d(batch, block_size=args.block_size)
+    flat = coeffs.reshape(B, rt["P"], 3, total_coeffs).detach().cpu().numpy()
+    zz_coeffs = flat[:, :, :, rt["zz"]]
+    sig = np.abs(flat).mean(axis=(2, 3)).astype(np.float32)
+    local_pos = np.asarray(rt["pending_local"], dtype=np.int64)
+    rt["patch_signal"][local_pos] = sig
+
+    chunk_offsets = np.zeros((len(rt["specs"]), args.num_bands), dtype=np.int64)
+    chunk_lengths = np.zeros((len(rt["specs"]), args.num_bands), dtype=np.int32)
+    chunk_raw = np.zeros((len(rt["specs"]), args.num_bands), dtype=np.int32)
+    for spec in rt["specs"]:
+        tile_index = int(spec["tile_index"])
+        block_ids = np.asarray(spec["block_ids"], dtype=np.int64)
+        tile = zz_coeffs[:, block_ids]
+        for band in range(args.num_bands):
+            start, end = rt["bounds"][band], rt["bounds"][band + 1]
+            data = tile[:, :, :, start:end]
+            if scales.shape[0] == 1:
+                q = np.rint(data / scales[0, band])
+            else:
+                q = np.rint(data / scales[:, band].reshape(1, 1, 3, 1))
+            q = np.clip(q, -128, 127).astype(np.int8, copy=False)
+            raw = np.ascontiguousarray(q).tobytes()
+            payload = zlib.compress(raw, level=args.compression_level)
+            chunk_offsets[tile_index, band] = rt["band_files"][band].tell()
+            rt["band_files"][band].write(payload)
+            chunk_lengths[tile_index, band] = len(payload)
+            chunk_raw[tile_index, band] = len(raw)
+    rt["offsets"].append(chunk_offsets)
+    rt["lengths"].append(chunk_lengths)
+    rt["raw_lengths"].append(chunk_raw)
+    rt["chunk_sizes"].append(B)
+    rt["pending_imgs"], rt["pending_local"] = [], []
+
+
+def finalize_bucket(args, bucket):
+    rt = bucket.pop("_runtime")
+    bucket_dir = os.path.join(args.out_dir, bucket["dir"])
+    for f in rt["band_files"]:
+        f.close()
+    rt["patch_signal"].flush()
+    np.save(os.path.join(bucket_dir, "offsets.npy"), np.stack(rt["offsets"]))
+    np.save(os.path.join(bucket_dir, "lengths.npy"), np.stack(rt["lengths"]))
+    np.save(os.path.join(bucket_dir, "raw_lengths.npy"), np.stack(rt["raw_lengths"]))
+    np.save(os.path.join(bucket_dir, "chunk_sizes.npy"), np.asarray(rt["chunk_sizes"], dtype=np.int32))
 
 
 def build_store(args):
@@ -265,12 +307,12 @@ def build_store(args):
     device = torch.device(args.device)
     scales = calibrate(args, device)
     np.save(os.path.join(args.out_dir, "scales.npy"), scales)
-    shapes, labels, keys = scan(args)
-    unique = sorted(set(keys))
-    key_to_id = {k: i for i, k in enumerate(unique)}
-    bucket_ids = np.asarray([key_to_id[k] for k in keys], dtype=np.int32)
+    shapes, labels = scan(args)
+    bucket_ids, bucket_shapes, bucket_meta = assign_coarse_buckets(
+        shapes, args.block_size, args.bucket_count
+    )
     positions = np.empty(len(labels), dtype=np.int32)
-    for bid in range(len(unique)):
+    for bid in range(len(bucket_shapes)):
         ids = np.flatnonzero(bucket_ids == bid)
         positions[ids] = np.arange(len(ids), dtype=np.int32)
     np.save(os.path.join(args.out_dir, "labels.npy"), labels)
@@ -278,10 +320,28 @@ def build_store(args):
     np.save(os.path.join(args.out_dir, "sample_bucket_positions.npy"), positions)
 
     buckets = []
-    for bid, key in enumerate(unique):
+    for bid, key in enumerate(bucket_shapes):
         ids = np.flatnonzero(bucket_ids == bid).astype(np.int64)
-        print(f"[orig-quant] bucket {bid+1}/{len(unique)} key={key} samples={len(ids)}", flush=True)
-        buckets.append(write_bucket(args, bid, key, ids, shapes, labels, scales, device))
+        print(f"[orig-quant] init bucket {bid+1}/{len(bucket_shapes)} key={key} samples={len(ids)}", flush=True)
+        buckets.append(init_bucket(args, bid, key, ids, shapes, labels))
+
+    local_counters = np.zeros(len(bucket_shapes), dtype=np.int64)
+    for global_idx, (img, _label) in enumerate(build_loader(args)):
+        if args.max_samples > 0 and global_idx >= args.max_samples:
+            break
+        bid = int(bucket_ids[global_idx])
+        rt = buckets[bid]["_runtime"]
+        rt["pending_imgs"].append(pad_to_block(img.float(), args.block_size))
+        rt["pending_local"].append(int(local_counters[bid]))
+        local_counters[bid] += 1
+        if len(rt["pending_imgs"]) >= args.chunk_size:
+            flush_bucket(args, buckets[bid], scales, device)
+        if (global_idx + 1) % 10000 == 0:
+            print(f"[orig-quant] wrote {global_idx + 1} samples", flush=True)
+
+    for bucket in buckets:
+        flush_bucket(args, bucket, scales, device)
+        finalize_bucket(args, bucket)
 
     total_coeffs = args.block_size * args.block_size
     band_size = total_coeffs // args.num_bands
@@ -300,6 +360,7 @@ def build_store(args):
         "quant_multiplier": float(args.quant_multiplier),
         "compression": "zlib",
         "compression_level": int(args.compression_level),
+        "coarse_bucket_metadata": bucket_meta,
         "zigzag_order": zigzag_order(args.block_size, args.block_size).numpy().tolist(),
         "buckets": buckets,
     }

@@ -27,6 +27,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-8}"
 NUM_BANDS="${NUM_BANDS:-16}"
 TILE_BLOCKS="${TILE_BLOCKS:-4}"
 CHUNK_SIZE="${CHUNK_SIZE:-128}"
+BUCKET_COUNT="${BUCKET_COUNT:-16}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 CALIBRATION_SAMPLES="${CALIBRATION_SAMPLES:-4096}"
@@ -45,6 +46,7 @@ python3 -m tdcf.prepare_imagenet1k_quantized_store \
     --num_bands "$NUM_BANDS" \
     --tile_blocks "$TILE_BLOCKS" \
     --chunk_size "$CHUNK_SIZE" \
+    --bucket_count "$BUCKET_COUNT" \
     --batch_size "$BATCH_SIZE" \
     --num_workers "$NUM_WORKERS" \
     --calibration_samples "$CALIBRATION_SAMPLES" \
@@ -61,6 +63,7 @@ python3 -m tdcf.prepare_imagenet1k_quantized_store \
     --num_bands "$NUM_BANDS" \
     --tile_blocks "$TILE_BLOCKS" \
     --chunk_size "$CHUNK_SIZE" \
+    --bucket_count "$BUCKET_COUNT" \
     --batch_size "$BATCH_SIZE" \
     --num_workers "$NUM_WORKERS" \
     --calibration_samples "$CALIBRATION_SAMPLES" \
