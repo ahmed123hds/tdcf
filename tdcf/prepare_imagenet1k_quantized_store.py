@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument("--scale_percentile", type=float, default=99.99)
     p.add_argument("--quant_multiplier", type=float, default=1.05)
     p.add_argument("--compression_level", type=int, default=6)
+    p.add_argument("--resize_shorter", type=int, default=256,
+                   help="Resize shorter edge to this size. Essential to prevent OOM on massive ImageNet panoramas.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -60,6 +62,11 @@ def build_loader(args):
             samples.append((img, i % 1000))
         return samples
 
+    def pre_transforms(img):
+        if args.resize_shorter > 0:
+            img = TF.resize(img, args.resize_shorter)
+        return TF.to_tensor(img)
+
     if args.shards is None:
         raise ValueError("--shards is required for webdataset source")
     import webdataset as wds
@@ -67,7 +74,7 @@ def build_loader(args):
         wds.WebDataset(args.shards, resampled=False, shardshuffle=False)
         .decode("pil")
         .to_tuple("jpg;jpeg;png", "cls")
-        .map_tuple(TF.to_tensor, identity_label)
+        .map_tuple(pre_transforms, identity_label)
     )
     return wds.WebLoader(
         dataset,
