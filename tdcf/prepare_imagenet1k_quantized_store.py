@@ -41,9 +41,12 @@ def parse_args():
     p.add_argument("--scale_percentile", type=float, default=99.99)
     p.add_argument("--quant_multiplier", type=float, default=1.05)
     p.add_argument("--compression_level", type=int, default=6)
-    p.add_argument("--max_longer", type=int, default=1024,
-                   help="Cap the LONGER edge to this value. Only resizes true outlier panoramas; "
-                        "leaves normal ImageNet images untouched. Preserves RandomResizedCrop diversity.")
+    p.add_argument("--max_longer", type=int, default=0,
+                   help="If >0, cap the longer edge to this value (outlier panoramas only). "
+                        "Default 0 = never resize; use max_flush_gb instead.")
+    p.add_argument("--max_flush_gb", type=float, default=12.0,
+                   help="Max RAM (GB) per flush. Chunk size is computed adaptively per bucket "
+                        "so peak usage stays under this. Default 12 GB is safe on a 32 GB VM.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -218,6 +221,17 @@ def assign_coarse_buckets(shapes: np.ndarray, block_size: int, bucket_count: int
 
 def init_bucket(args, bucket_id, key, global_ids, shapes, labels):
     nph, npw = key
+    chunk_size = _adaptive_chunk_size(
+        nph, npw, args.block_size, args.max_flush_gb, args.chunk_size
+    )
+    if chunk_size < args.chunk_size:
+        print(
+            f"[orig-quant] bucket {bucket_id:03d} key={key}: canvas "
+            f"{nph * args.block_size}x{npw * args.block_size} px → "
+            f"adaptive chunk_size={chunk_size} (base={args.chunk_size}, "
+            f"peak RAM ≈ {chunk_size * 3 * nph * args.block_size * npw * args.block_size * 4 * 2 / 1e9:.2f} GB)",
+            flush=True,
+        )
     P = nph * npw
     total_coeffs = args.block_size * args.block_size
     band_size = total_coeffs // args.num_bands
@@ -257,8 +271,23 @@ def init_bucket(args, bucket_id, key, global_ids, shapes, labels):
             "chunk_sizes": [],
             "pending_imgs": [],
             "pending_local": [],
+            "chunk_size": chunk_size,
         },
     }
+
+
+def _adaptive_chunk_size(nph, npw, block_size, max_flush_gb, base_chunk):
+    """Compute the largest chunk_size that keeps peak RAM under max_flush_gb.
+
+    Peak RAM = chunk_size * 3 * canvas_h * canvas_w * 4 bytes (float32) * 2
+    (x2 because the DCT output tensor of equal size coexists with the input)
+    """
+    canvas_h = nph * block_size
+    canvas_w = npw * block_size
+    bytes_per_image = 3 * canvas_h * canvas_w * 4 * 2  # float32 x 2 tensors
+    max_bytes = max_flush_gb * (1024 ** 3)
+    safe_chunk = max(1, int(max_bytes / bytes_per_image))
+    return min(base_chunk, safe_chunk)
 
 
 def flush_bucket(args, bucket, scales, device):
@@ -355,7 +384,7 @@ def build_store(args):
         rt["pending_imgs"].append(pad_to_block(img.float(), args.block_size))
         rt["pending_local"].append(int(local_counters[bid]))
         local_counters[bid] += 1
-        if len(rt["pending_imgs"]) >= args.chunk_size:
+        if len(rt["pending_imgs"]) >= rt["chunk_size"]:
             flush_bucket(args, buckets[bid], scales, device)
         if (global_idx + 1) % 10000 == 0:
             elapsed = time.time() - start_time
