@@ -41,8 +41,9 @@ def parse_args():
     p.add_argument("--scale_percentile", type=float, default=99.99)
     p.add_argument("--quant_multiplier", type=float, default=1.05)
     p.add_argument("--compression_level", type=int, default=6)
-    p.add_argument("--resize_shorter", type=int, default=256,
-                   help="Resize shorter edge to this size. Essential to prevent OOM on massive ImageNet panoramas.")
+    p.add_argument("--max_longer", type=int, default=1024,
+                   help="Cap the LONGER edge to this value. Only resizes true outlier panoramas; "
+                        "leaves normal ImageNet images untouched. Preserves RandomResizedCrop diversity.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -63,8 +64,14 @@ def build_loader(args):
         return samples
 
     def pre_transforms(img):
-        if args.resize_shorter > 0:
-            img = TF.resize(img, args.resize_shorter)
+        # Only cap true outlier panoramas. Normal ImageNet images (~300-600px) are stored
+        # at full resolution so RandomResizedCrop diversity is fully preserved during training.
+        if args.max_longer > 0:
+            w, h = img.size  # PIL: (width, height)
+            longer = max(h, w)
+            if longer > args.max_longer:
+                scale = args.max_longer / longer
+                img = img.resize((int(round(w * scale)), int(round(h * scale))))
         return TF.to_tensor(img)
 
     if args.shards is None:
