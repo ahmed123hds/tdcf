@@ -181,9 +181,14 @@ def scan(args):
 def _bucket_factorization(bucket_count: int):
     if bucket_count <= 0 or bucket_count & (bucket_count - 1):
         raise ValueError("--bucket_count must be a power of two")
-    ratio_bins = min(8, max(2, int(round(math.sqrt(bucket_count)))))
-    while bucket_count % ratio_bins != 0:
-        ratio_bins //= 2
+    # Use 2^floor(log2(sqrt(B))) so ratio_bins is always a power-of-two
+    # that cleanly divides bucket_count:
+    #   B=8  -> 4 area × 2 ratio
+    #   B=16 -> 4 area × 4 ratio
+    #   B=32 -> 8 area × 4 ratio
+    #   B=64 -> 8 area × 8 ratio
+    ratio_bins = 2 ** int(math.floor(math.log2(math.sqrt(bucket_count))))
+    ratio_bins = min(8, max(2, ratio_bins))
     area_bins = bucket_count // ratio_bins
     return area_bins, ratio_bins
 
@@ -372,6 +377,33 @@ def build_store(args):
         ids = np.flatnonzero(bucket_ids == bid).astype(np.int64)
         print(f"[orig-quant] init bucket {bid+1}/{len(bucket_shapes)} key={key} samples={len(ids)}", flush=True)
         buckets.append(init_bucket(args, bid, key, ids, shapes, labels))
+
+    # ── Storage forecast ──────────────────────────────────────────────
+    total_coeffs = args.block_size * args.block_size
+    sum_nb_pb = 0
+    print(f"\n{'='*80}", flush=True)
+    print(f"[STORAGE FORECAST] bucket_count={len(bucket_shapes)} block_size={args.block_size}", flush=True)
+    print(f"{'B':>3} | {'Key (nph,npw)':<18} | {'Canvas (px)':<14} | {'N_b':>8} | {'P_b':>8} | {'N×P':>14} | {'Raw int8 (GB)':>14}", flush=True)
+    print(f"{'-'*3}-+-{'-'*18}-+-{'-'*14}-+-{'-'*8}-+-{'-'*8}-+-{'-'*14}-+-{'-'*14}", flush=True)
+    for bid, key in enumerate(bucket_shapes):
+        nph, npw = key
+        n_b = int(np.sum(bucket_ids == bid))
+        p_b = nph * npw
+        nb_pb = n_b * p_b
+        sum_nb_pb += nb_pb
+        canvas_h, canvas_w = nph * args.block_size, npw * args.block_size
+        raw_gb = (n_b * p_b * 3 * total_coeffs * 1) / (1024**3)  # int8
+        print(f"{bid:>3} | {str(key):<18} | {canvas_h}x{canvas_w:<8} | {n_b:>8} | {p_b:>8} | {nb_pb:>14,} | {raw_gb:>13.2f}", flush=True)
+    raw_total_gb = (sum_nb_pb * 3 * total_coeffs * 1) / (1024**3)
+    patch_signal_gb = (sum_nb_pb * 4) / (1024**3)
+    print(f"{'-'*3}-+-{'-'*18}-+-{'-'*14}-+-{'-'*8}-+-{'-'*8}-+-{'-'*14}-+-{'-'*14}", flush=True)
+    print(f"{'':>3} | {'TOTAL':<18} | {'':14} | {len(labels):>8} | {'':>8} | {sum_nb_pb:>14,} | {raw_total_gb:>13.2f}", flush=True)
+    print(f"\n  Raw int8 coefficients (before zlib): {raw_total_gb:.2f} GB", flush=True)
+    print(f"  patch_signal.npy (float32, uncompressed): {patch_signal_gb:.2f} GB", flush=True)
+    print(f"  NOTE: final size depends on zlib compression ratio (~20-40% of raw for real content, ~0% for padding zeros).", flush=True)
+    print(f"  If these numbers are too large, abort and re-run with a higher --bucket_count.", flush=True)
+    print(f"{'='*80}\n", flush=True)
+    # ──────────────────────────────────────────────────────────────────
 
     local_counters = np.zeros(len(bucket_shapes), dtype=np.int64)
     total_samples = len(labels)
