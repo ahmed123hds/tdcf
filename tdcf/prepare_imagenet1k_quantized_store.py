@@ -47,6 +47,13 @@ def parse_args():
     p.add_argument("--max_flush_gb", type=float, default=12.0,
                    help="Max RAM (GB) per flush. Chunk size is computed adaptively per bucket "
                         "so peak usage stays under this. Default 12 GB is safe on a 32 GB VM.")
+    p.add_argument("--forecast_only", action="store_true",
+                   help="Print storage forecast table and exit. No data is written.")
+    p.add_argument("--scan_cache", type=str, default="",
+                   help="Path to .npz file for caching scan results (shapes, labels). "
+                        "If the file exists, skip the scan and load from cache. "
+                        "If it does not exist, scan and save to this path. "
+                        "Enables instant bucket count sweeps after one scan.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -358,25 +365,23 @@ def build_store(args):
     np.random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device)
-    scales = calibrate(args, device)
-    np.save(os.path.join(args.out_dir, "scales.npy"), scales)
-    shapes, labels = scan(args)
+
+    # ── Scan (or load from cache) ─────────────────────────────────────
+    if args.scan_cache and os.path.exists(args.scan_cache):
+        print(f"[orig-quant] Loading cached scan from {args.scan_cache}", flush=True)
+        cached = np.load(args.scan_cache)
+        shapes = cached["shapes"]
+        labels = cached["labels"]
+        print(f"[orig-quant] Loaded {len(labels)} samples from cache", flush=True)
+    else:
+        shapes, labels = scan(args)
+        if args.scan_cache:
+            np.savez(args.scan_cache, shapes=shapes, labels=labels)
+            print(f"[orig-quant] Saved scan cache to {args.scan_cache}", flush=True)
+
     bucket_ids, bucket_shapes, bucket_meta = assign_coarse_buckets(
         shapes, args.block_size, args.bucket_count
     )
-    positions = np.empty(len(labels), dtype=np.int32)
-    for bid in range(len(bucket_shapes)):
-        ids = np.flatnonzero(bucket_ids == bid)
-        positions[ids] = np.arange(len(ids), dtype=np.int32)
-    np.save(os.path.join(args.out_dir, "labels.npy"), labels)
-    np.save(os.path.join(args.out_dir, "sample_bucket_ids.npy"), bucket_ids)
-    np.save(os.path.join(args.out_dir, "sample_bucket_positions.npy"), positions)
-
-    buckets = []
-    for bid, key in enumerate(bucket_shapes):
-        ids = np.flatnonzero(bucket_ids == bid).astype(np.int64)
-        print(f"[orig-quant] init bucket {bid+1}/{len(bucket_shapes)} key={key} samples={len(ids)}", flush=True)
-        buckets.append(init_bucket(args, bid, key, ids, shapes, labels))
 
     # ── Storage forecast ──────────────────────────────────────────────
     total_coeffs = args.block_size * args.block_size
@@ -400,10 +405,32 @@ def build_store(args):
     print(f"{'':>3} | {'TOTAL':<18} | {'':14} | {len(labels):>8} | {'':>8} | {sum_nb_pb:>14,} | {raw_total_gb:>13.2f}", flush=True)
     print(f"\n  Raw int8 coefficients (before zlib): {raw_total_gb:.2f} GB", flush=True)
     print(f"  patch_signal.npy (float32, uncompressed): {patch_signal_gb:.2f} GB", flush=True)
-    print(f"  NOTE: final size depends on zlib compression ratio (~20-40% of raw for real content, ~0% for padding zeros).", flush=True)
-    print(f"  If these numbers are too large, abort and re-run with a higher --bucket_count.", flush=True)
+    print(f"  NOTE: final size depends on zlib compression ratio (~20-40% for real content, ~0% for padding zeros).", flush=True)
+    print(f"  If these numbers are too large, re-run with a higher --bucket_count.", flush=True)
     print(f"{'='*80}\n", flush=True)
     # ──────────────────────────────────────────────────────────────────
+
+    if args.forecast_only:
+        print("[orig-quant] --forecast_only set. Exiting without writing.", flush=True)
+        return
+
+    # ── Full build: save metadata, init buckets, calibrate, write ────
+    positions = np.empty(len(labels), dtype=np.int32)
+    for bid in range(len(bucket_shapes)):
+        ids = np.flatnonzero(bucket_ids == bid)
+        positions[ids] = np.arange(len(ids), dtype=np.int32)
+    np.save(os.path.join(args.out_dir, "labels.npy"), labels)
+    np.save(os.path.join(args.out_dir, "sample_bucket_ids.npy"), bucket_ids)
+    np.save(os.path.join(args.out_dir, "sample_bucket_positions.npy"), positions)
+
+    buckets = []
+    for bid, key in enumerate(bucket_shapes):
+        ids = np.flatnonzero(bucket_ids == bid).astype(np.int64)
+        print(f"[orig-quant] init bucket {bid+1}/{len(bucket_shapes)} key={key} samples={len(ids)}", flush=True)
+        buckets.append(init_bucket(args, bid, key, ids, shapes, labels))
+
+    scales = calibrate(args, device)
+    np.save(os.path.join(args.out_dir, "scales.npy"), scales)
 
     local_counters = np.zeros(len(bucket_shapes), dtype=np.int64)
     total_samples = len(labels)
