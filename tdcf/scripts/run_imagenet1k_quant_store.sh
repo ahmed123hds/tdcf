@@ -23,7 +23,7 @@ export PJRT_DEVICE=TPU
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-DATA_DIR="${DATA_DIR:-/mnt/dataset_disk/imagenet1k_quant_dct_288}"
+DATA_DIR="${DATA_DIR:-/mnt/dataset_disk/imagenet1k_quant_dct_original}"
 MAX_RETRIES="${MAX_RETRIES:-20}"
 RETRY_WAIT="${RETRY_WAIT:-30}"
 

@@ -17,7 +17,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 
 from torch.utils.data import DataLoader
 
-from tdcf.quantized_store import ChunkBatchSampler, QuantizedFixedDCTStore
+from tdcf.quantized_store import BucketBatchSampler, OriginalQuantizedDCTStore
 from tdcf.scheduler import BudgetScheduler
 
 
@@ -40,20 +40,20 @@ class InputNormalize(nn.Module):
 
 
 class FixedPilotStats:
-    def __init__(self, P: int, num_bands: int, band_size: int):
-        self.P = int(P)
+    def __init__(self, num_bands: int, band_size: int):
         self.num_bands = int(num_bands)
         self.band_size = int(band_size)
-        self.patch_sensitivity_history = []
+        self.patch_sensitivity_history_by_bucket = {}
         self.band_sensitivity_history = []
         self.begin_epoch()
 
     def begin_epoch(self):
-        self.patch_accum = None
+        self.patch_accum_by_bucket = {}
+        self.patch_count_by_bucket = {}
         self.band_accum = None
         self.step_count = 0
 
-    def accumulate(self, grad_zz: torch.Tensor):
+    def accumulate(self, bucket_id: int, grad_zz: torch.Tensor):
         grad = grad_zz.detach().abs()
         patch = grad.sum(dim=(2, 3)).mean(dim=0).cpu()
         band_vals = []
@@ -62,19 +62,26 @@ class FixedPilotStats:
             end = (band + 1) * self.band_size if band < self.num_bands - 1 else grad.shape[-1]
             band_vals.append(grad[:, :, :, start:end].mean(dim=(0, 1, 2, 3)).cpu())
         band = torch.stack(band_vals)
-        self.patch_accum = patch if self.patch_accum is None else self.patch_accum + patch
+        if bucket_id not in self.patch_accum_by_bucket:
+            self.patch_accum_by_bucket[bucket_id] = torch.zeros_like(patch)
+            self.patch_count_by_bucket[bucket_id] = 0
+        self.patch_accum_by_bucket[bucket_id] += patch
+        self.patch_count_by_bucket[bucket_id] += 1
         self.band_accum = band if self.band_accum is None else self.band_accum + band
         self.step_count += 1
 
     def finalize_epoch(self):
         if self.step_count == 0:
             return
-        patch = self.patch_accum / self.step_count
         band = self.band_accum / self.step_count
-        patch = patch / (patch.sum() + 1e-8)
         band = band / (band.sum() + 1e-8)
-        self.patch_sensitivity_history.append(patch.numpy().astype(np.float32))
         self.band_sensitivity_history.append(band.numpy().astype(np.float32))
+        for bucket_id, patch_accum in self.patch_accum_by_bucket.items():
+            patch = patch_accum / max(self.patch_count_by_bucket[bucket_id], 1)
+            patch = patch / (patch.sum() + 1e-8)
+            self.patch_sensitivity_history_by_bucket.setdefault(bucket_id, []).append(
+                patch.numpy().astype(np.float32)
+            )
 
 
 def parse_args():
@@ -150,9 +157,8 @@ def make_scheduler(args, optimizer):
 
 
 def make_loader(store, batch_size, world_size, rank, shuffle, drop_last, seed):
-    sampler = ChunkBatchSampler(
-        dataset_len=store.N,
-        chunk_size=store.chunk_size,
+    sampler = BucketBatchSampler(
+        bucket_ids=store.sample_bucket_ids,
         batch_size=batch_size,
         num_replicas=world_size,
         rank=rank,
@@ -180,8 +186,8 @@ def train_process(index, args):
     np.random.seed(seed)
     random.seed(seed)
 
-    train_store = QuantizedFixedDCTStore(os.path.join(args.data_dir, "train"), device=device, output_size=args.img_size)
-    val_store = QuantizedFixedDCTStore(os.path.join(args.data_dir, "val"), device=device, output_size=args.img_size)
+    train_store = OriginalQuantizedDCTStore(os.path.join(args.data_dir, "train"), device=device, output_size=args.img_size)
+    val_store = OriginalQuantizedDCTStore(os.path.join(args.data_dir, "val"), device=device, output_size=args.img_size)
     train_loader, train_sampler = make_loader(
         train_store, args.batch_size, world_size, rank, True, True, args.seed
     )
@@ -197,7 +203,7 @@ def train_process(index, args):
     if args.budget_mode:
         scheduler = BudgetScheduler(
             train_store.num_bands,
-            train_store.P,
+            num_patches=196,
             beta=args.beta,
             max_beta=args.max_beta,
             gamma=args.gamma,
@@ -209,14 +215,14 @@ def train_process(index, args):
     model = build_model(args, device)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
     pilot_opt = make_optimizer(args, model, scaled_pilot_lr)
-    pilot_stats = FixedPilotStats(train_store.P, train_store.num_bands, train_store.band_size)
+    pilot_stats = FixedPilotStats(train_store.num_bands, train_store.band_size)
     pilot_steps = max(1, int(len(train_loader) * args.pilot_ratio))
 
     if is_master:
         print("=" * 72)
         print(
             f"TDCF ImageNet-1K Quantized Store | backbone={args.backbone} | "
-            f"view={train_store.view_size} crop={args.img_size} P={train_store.P} "
+            f"buckets={len(train_store.bucket_infos)} crop={args.img_size} "
             f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}"
         )
         print("=" * 72)
@@ -235,9 +241,9 @@ def train_process(index, args):
                     break
                 idx_np = indices.numpy()
                 labels = labels.to(device)
-                coeffs_zz, crop_params, _visible, _k = train_store.read_coeffs(idx_np)
+                coeffs_zz, crop_params, _visible, _k, bucket_id = train_store.read_coeffs(idx_np)
                 coeffs_zz = coeffs_zz.to(device, non_blocking=True).detach().requires_grad_(True)
-                x = train_store.reconstruct_crops(coeffs_zz, crop_params)
+                x = train_store.reconstruct_crops(coeffs_zz, idx_np, crop_params, bucket_id)
 
                 pilot_opt.zero_grad(set_to_none=True)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
@@ -245,7 +251,7 @@ def train_process(index, args):
                     loss = criterion(logits, labels)
                 loss.backward()
                 if coeffs_zz.grad is not None:
-                    pilot_stats.accumulate(coeffs_zz.grad)
+                    pilot_stats.accumulate(bucket_id, coeffs_zz.grad)
                 xm.reduce_gradients(pilot_opt)
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -291,11 +297,14 @@ def train_process(index, args):
         if args.skip_pilot:
             train_store.set_full_fidelity()
         elif args.budget_mode:
-            ps = pilot_stats.patch_sensitivity_history[min(ep, len(pilot_stats.patch_sensitivity_history) - 1)]
+            ps = {
+                bucket_id: hist[min(ep, len(hist) - 1)]
+                for bucket_id, hist in pilot_stats.patch_sensitivity_history_by_bucket.items()
+            }
             bs = pilot_stats.band_sensitivity_history[min(ep, len(pilot_stats.band_sensitivity_history) - 1)]
             train_store.set_budget_ratio(
                 scheduler.get_io_ratio(ep),
-                patch_sensitivity=ps,
+                patch_sensitivity_by_bucket=ps,
                 band_sensitivity=bs,
                 k_low=args.k_low,
                 patch_policy=args.patch_policy,
@@ -312,7 +321,7 @@ def train_process(index, args):
         for step, (indices, labels) in enumerate(train_loader):
             idx_np = indices.numpy()
             labels = labels.to(device)
-            x, _crop, _visible, _k = train_store.serve_indices(idx_np, deterministic_val=False)
+            x, _crop, _visible, _k, _bucket_id = train_store.serve_indices(idx_np, deterministic_val=False)
 
             if step == 0 and is_master:
                 print("  -> Got first batch from quantized store! Building XLA graph...", flush=True)
@@ -367,7 +376,7 @@ def train_process(index, args):
             for indices, labels in val_loader:
                 idx_np = indices.numpy()
                 labels = labels.to(device)
-                x, _crop, _visible, _k = val_store.serve_indices(idx_np, deterministic_val=True)
+                x, _crop, _visible, _k, _bucket_id = val_store.serve_indices(idx_np, deterministic_val=True)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
                     loss = criterion(logits, labels)

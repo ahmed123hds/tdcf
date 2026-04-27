@@ -191,7 +191,7 @@ written as JSON and CSV under `./results/dct_quant_precision_*`.
 ### Quantized ImageNet-1K physical store
 
 After the precision search passes on ImageNet samples, build the compressed
-fixed-view coefficient store:
+original-size coefficient store:
 
 ```bash
 bash tdcf/scripts/run_prepare_imagenet1k_quant_store.sh
@@ -200,14 +200,14 @@ bash tdcf/scripts/run_prepare_imagenet1k_quant_store.sh
 By default this writes:
 
 ```text
-/mnt/dataset_disk/imagenet1k_quant_dct_288/train
-/mnt/dataset_disk/imagenet1k_quant_dct_288/val
+/mnt/dataset_disk/imagenet1k_quant_dct_original/train
+/mnt/dataset_disk/imagenet1k_quant_dct_original/val
 ```
 
-The store uses `288x288` fixed views, `8x8` block-DCT, int8 quantized
-coefficients, zlib-compressed tile/band chunks, and block-aligned random
-`224x224` crops during training. This path reports real compressed coefficient
-bytes read per epoch.
+The store keeps each image at its original spatial size, pads only to an `8x8`
+block grid, stores int8 quantized DCT coefficients in zlib-compressed tile/band
+chunks, and samples random crops in the original image coordinate system during
+training. This path reports real compressed coefficient bytes read per epoch.
 
 Run the physical-I/O capped experiments with:
 

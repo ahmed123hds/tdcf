@@ -3,8 +3,8 @@
 # Build compressed int8 fixed-view ImageNet-1K DCT stores under /mnt.
 #
 # Default layout:
-#   /mnt/dataset_disk/imagenet1k_quant_dct_288/train
-#   /mnt/dataset_disk/imagenet1k_quant_dct_288/val
+#   /mnt/dataset_disk/imagenet1k_quant_dct_original/train
+#   /mnt/dataset_disk/imagenet1k_quant_dct_original/val
 # =============================================================================
 
 set -euo pipefail
@@ -22,8 +22,7 @@ if [ -z "${VAL_SHARDS:-}" ]; then
     VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
 fi
 
-OUT_ROOT="${OUT_ROOT:-/mnt/dataset_disk/imagenet1k_quant_dct_288}"
-VIEW_SIZE="${VIEW_SIZE:-288}"
+OUT_ROOT="${OUT_ROOT:-/mnt/dataset_disk/imagenet1k_quant_dct_original}"
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
 NUM_BANDS="${NUM_BANDS:-16}"
 TILE_BLOCKS="${TILE_BLOCKS:-4}"
@@ -42,7 +41,6 @@ python3 -m tdcf.prepare_imagenet1k_quantized_store \
     --source webdataset \
     --shards "$TRAIN_SHARDS" \
     --out_dir "$OUT_ROOT/train" \
-    --view_size "$VIEW_SIZE" \
     --block_size "$BLOCK_SIZE" \
     --num_bands "$NUM_BANDS" \
     --tile_blocks "$TILE_BLOCKS" \
@@ -59,7 +57,6 @@ python3 -m tdcf.prepare_imagenet1k_quantized_store \
     --source webdataset \
     --shards "$VAL_SHARDS" \
     --out_dir "$OUT_ROOT/val" \
-    --view_size "$VIEW_SIZE" \
     --block_size "$BLOCK_SIZE" \
     --num_bands "$NUM_BANDS" \
     --tile_blocks "$TILE_BLOCKS" \
