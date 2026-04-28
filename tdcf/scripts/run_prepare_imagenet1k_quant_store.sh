@@ -34,6 +34,7 @@ CALIBRATION_SAMPLES="${CALIBRATION_SAMPLES:-4096}"
 QUANT_MULTIPLIER="${QUANT_MULTIPLIER:-1.05}"
 COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-6}"
 DEVICE="${DEVICE:-cpu}"
+MAX_LONGER="${MAX_LONGER:-0}"
 
 mkdir -p "$OUT_ROOT"
 
@@ -53,6 +54,7 @@ python3 -m tdcf.prepare_imagenet1k_quantized_store \
     --quant_multiplier "$QUANT_MULTIPLIER" \
     --compression_level "$COMPRESSION_LEVEL" \
     --device "$DEVICE" \
+    --max_longer "$MAX_LONGER" \
     ${FORECAST_ONLY:+--forecast_only} \
     ${SCAN_CACHE:+--scan_cache "$SCAN_CACHE"}
 
@@ -71,6 +73,7 @@ python3 -m tdcf.prepare_imagenet1k_quantized_store \
     --calibration_samples "$CALIBRATION_SAMPLES" \
     --quant_multiplier "$QUANT_MULTIPLIER" \
     --compression_level "$COMPRESSION_LEVEL" \
-    --device "$DEVICE"
+    --device "$DEVICE" \
+    --max_longer "$MAX_LONGER"
 
 echo "[prep-quant] Done. Store root: $OUT_ROOT"
