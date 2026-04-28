@@ -43,7 +43,10 @@ for B in $BUCKETS; do
         --quant_multiplier "${QUANT_MULTIPLIER:-1.05}" \
         --compression_level "${COMPRESSION_LEVEL:-6}" \
         --max_samples "$MAX_SAMPLES" \
-        --device "$DEVICE"
+        --device "$DEVICE" \
+        --max_longer "${MAX_LONGER:-0}" \
+        ${FORECAST_ONLY:+--forecast_only} \
+        ${SCAN_CACHE:+--scan_cache "$SCAN_CACHE"}
     echo "[bucket-sweep] B=$B build_time=${SECONDS}s"
     du -sh "$OUT_DIR"
 done
