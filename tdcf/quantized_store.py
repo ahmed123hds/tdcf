@@ -186,7 +186,7 @@ class OriginalQuantizedDCTStore:
         self.chunk_size = int(self.meta["chunk_size"])
         self.dtype = np.dtype(self.meta["dtype"])
         self.zz = np.asarray(self.meta["zigzag_order"], dtype=np.int64)
-        self.zz_torch = torch.tensor(self.zz, dtype=torch.long, device=self.device)
+        self._zz_torch_cache = {}
         self.scales = np.load(os.path.join(root, "scales.npy")).astype(np.float32)
 
         self.labels = np.load(os.path.join(root, "labels.npy"), mmap_mode="r")
@@ -245,6 +245,14 @@ class OriginalQuantizedDCTStore:
             handle = open(bucket.band_paths[band_index], "rb")
             bucket.band_files[band_index] = handle
         return handle
+
+    def _get_zz_torch(self, device: torch.device):
+        key = str(device)
+        zz = self._zz_torch_cache.get(key)
+        if zz is None:
+            zz = torch.as_tensor(self.zz, dtype=torch.long, device=device)
+            self._zz_torch_cache[key] = zz
+        return zz
 
     def reset_epoch_io(self):
         self.bytes_read_epoch = 0
@@ -436,8 +444,9 @@ class OriginalQuantizedDCTStore:
         bucket = self.bucket_infos[bucket_id]
 
         coeffs_zz = coeffs_zz.to(self.device, non_blocking=True)
+        zz_torch = self._get_zz_torch(coeffs_zz.device)
         coeffs_flat = torch.zeros_like(coeffs_zz, device=self.device)
-        coeffs_flat[:, :, :, self.zz_torch] = coeffs_zz
+        coeffs_flat[:, :, :, zz_torch] = coeffs_zz
         coeffs = coeffs_flat.reshape(coeffs_flat.shape[0], bucket.P, self.C, self.block_size, self.block_size)
         canvas = block_idct2d(coeffs, bucket.nph, bucket.npw)
         crops = []

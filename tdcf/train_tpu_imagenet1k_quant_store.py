@@ -188,24 +188,45 @@ def train_process(index, args):
 
     if is_master:
         print("[INIT] Opening quantized train store...", flush=True)
+    init_start = time.time()
     train_store = OriginalQuantizedDCTStore(
         os.path.join(args.data_dir, "train"),
         device=device,
         output_size=args.img_size,
     )
     if is_master:
+        print(
+            f"[INIT] Train store ready in {time.time() - init_start:.1f}s | "
+            f"samples={train_store.N} buckets={len(train_store.bucket_infos)}",
+            flush=True,
+        )
         print("[INIT] Opening quantized val store...", flush=True)
+    init_start = time.time()
     val_store = OriginalQuantizedDCTStore(
         os.path.join(args.data_dir, "val"),
         device=device,
         output_size=args.img_size,
     )
+    if is_master:
+        print(
+            f"[INIT] Val store ready in {time.time() - init_start:.1f}s | "
+            f"samples={val_store.N} buckets={len(val_store.bucket_infos)}",
+            flush=True,
+        )
+        print("[INIT] Building same-bucket loaders...", flush=True)
+    init_start = time.time()
     train_loader, train_sampler = make_loader(
         train_store, args.batch_size, world_size, rank, True, True, args.seed
     )
     val_loader, val_sampler = make_loader(
         val_store, args.eval_batch_size, world_size, rank, False, False, args.seed
     )
+    if is_master:
+        print(
+            f"[INIT] Loaders ready in {time.time() - init_start:.1f}s | "
+            f"train_steps={len(train_loader)} val_steps={len(val_loader)}",
+            flush=True,
+        )
 
     global_bs = args.batch_size * world_size
     scaled_lr = args.base_lr * (global_bs / float(args.lr_ref_batch))
@@ -224,11 +245,16 @@ def train_process(index, args):
     else:
         scheduler = None
 
+    if is_master:
+        print("[INIT] Building model on XLA device...", flush=True)
+    init_start = time.time()
     model = build_model(args, device)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
     pilot_opt = make_optimizer(args, model, scaled_pilot_lr)
     pilot_stats = FixedPilotStats(train_store.num_bands, train_store.band_size)
     pilot_steps = max(1, int(len(train_loader) * args.pilot_ratio))
+    if is_master:
+        print(f"[INIT] Model ready in {time.time() - init_start:.1f}s", flush=True)
 
     if is_master:
         print("=" * 72)
