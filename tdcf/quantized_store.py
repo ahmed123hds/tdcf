@@ -325,6 +325,22 @@ class OriginalQuantizedDCTStore:
                 visible[b, row * bucket.npw + col0:row * bucket.npw + col1] = True
         return visible
 
+    def _crop_block_rects(self, bucket: QuantBucketInfo, crop_params: np.ndarray):
+        rects = np.zeros((len(crop_params), 4), dtype=np.int64)
+        local_nph = 1
+        local_npw = 1
+        for b, (top, left, height, width) in enumerate(crop_params):
+            row0 = max(0, int(top) // self.block_size)
+            col0 = max(0, int(left) // self.block_size)
+            row1 = min(bucket.nph, math.ceil((int(top) + int(height)) / self.block_size))
+            col1 = min(bucket.npw, math.ceil((int(left) + int(width)) / self.block_size))
+            row1 = max(row1, min(bucket.nph, row0 + 1))
+            col1 = max(col1, min(bucket.npw, col0 + 1))
+            rects[b] = (row0, col0, row1, col1)
+            local_nph = max(local_nph, row1 - row0)
+            local_npw = max(local_npw, col1 - col0)
+        return rects, int(local_nph), int(local_npw)
+
     def _compute_k_allocation(self, bucket_id, bucket, local_positions, visible_mask):
         if self.mode == "full":
             out = np.zeros((len(local_positions), bucket.P), dtype=np.int32)
@@ -433,6 +449,73 @@ class OriginalQuantizedDCTStore:
         self.samples_read_epoch += len(indices)
         return torch.from_numpy(coeffs_zz), crop_params, visible_mask, k_alloc, bucket_id
 
+    @torch.no_grad()
+    def read_crop_coeffs(self, indices, crop_params=None, deterministic_val=False):
+        if torch.is_tensor(indices):
+            indices = indices.detach().cpu().numpy()
+        else:
+            indices = np.asarray(indices, dtype=np.int64)
+        bucket_id, local_positions = self._resolve_bucket_batch(indices)
+        bucket = self.bucket_infos[bucket_id]
+        if crop_params is None:
+            crop_params = self._sample_crop_params(bucket, local_positions, deterministic_val)
+        else:
+            crop_params = np.asarray(crop_params, dtype=np.int64)
+
+        rects, local_nph, local_npw = self._crop_block_rects(bucket, crop_params)
+        visible_mask = self._build_visible_mask(bucket, crop_params)
+        k_alloc = self._compute_k_allocation(bucket_id, bucket, local_positions, visible_mask)
+        local_p = local_nph * local_npw
+        coeffs_zz = np.zeros((len(indices), local_p, self.C, self.total_coeffs), dtype=np.float32)
+
+        for chunk_id, batch_rows, local_rows in self._chunk_groups(local_positions, bucket):
+            chunk_n = int(bucket.chunk_sizes[chunk_id])
+            for spec in bucket.tile_specs:
+                tile_index = int(spec["tile_index"])
+                block_ids = np.asarray(spec["block_ids"], dtype=np.int64)
+                tile_visible = visible_mask[np.ix_(batch_rows, block_ids)]
+                if not tile_visible.any():
+                    continue
+                for band_index in range(self.num_bands):
+                    self.full_bytes_epoch += int(bucket.lengths[chunk_id, tile_index, band_index])
+                    self.full_bytes_total += int(bucket.lengths[chunk_id, tile_index, band_index])
+                    keep = k_alloc[np.ix_(batch_rows, block_ids)] > band_index
+                    if not keep.any():
+                        continue
+                    raw = self._read_record(bucket, chunk_id, tile_index, band_index)
+                    band_size = min((band_index + 1) * self.band_size, self.total_coeffs) - band_index * self.band_size
+                    arr = np.frombuffer(raw, dtype=np.int8).reshape(chunk_n, len(block_ids), self.C, band_size)
+                    selected = arr[local_rows].astype(np.float32)
+                    if self.scales.shape[0] == 1:
+                        selected *= float(self.scales[0, band_index])
+                    else:
+                        selected *= self.scales[:, band_index].reshape(1, 1, self.C, 1)
+
+                    start = band_index * self.band_size
+                    end = start + band_size
+                    for rr, batch_row in enumerate(batch_rows):
+                        cols = np.flatnonzero(tile_visible[rr] & keep[rr])
+                        if len(cols) == 0:
+                            continue
+                        gids = block_ids[cols]
+                        global_rows = gids // bucket.npw
+                        global_cols = gids % bucket.npw
+                        row0, col0, _row1, _col1 = rects[batch_row]
+                        local_ids = (global_rows - row0) * local_npw + (global_cols - col0)
+                        coeffs_zz[batch_row, local_ids, :, start:end] = selected[rr, cols]
+
+        self.samples_read_epoch += len(indices)
+        return (
+            torch.from_numpy(coeffs_zz),
+            crop_params,
+            visible_mask,
+            k_alloc,
+            bucket_id,
+            rects,
+            local_nph,
+            local_npw,
+        )
+
     def reconstruct_crops(self, coeffs_zz: torch.Tensor, indices, crop_params, bucket_id: int):
         if torch.is_tensor(indices):
             indices = indices.detach().cpu().numpy()
@@ -467,12 +550,53 @@ class OriginalQuantizedDCTStore:
             crops.append(crop)
         return torch.cat(crops, dim=0).clamp_(0.0, 1.0)
 
+    def reconstruct_local_crops(
+        self,
+        coeffs_zz: torch.Tensor,
+        crop_params,
+        rects: np.ndarray,
+        local_nph: int,
+        local_npw: int,
+    ):
+        # XLA recompiles aggressively for variable crop-grid shapes. Keep the
+        # variable-size inverse DCT on CPU, then transfer fixed 224x224 images.
+        work_device = torch.device("cpu") if self.device.type == "xla" else self.device
+        coeffs_zz = coeffs_zz.to(work_device, non_blocking=True)
+        zz_torch = self._get_zz_torch(coeffs_zz.device)
+        coeffs_flat = torch.zeros_like(coeffs_zz, device=work_device)
+        coeffs_flat[:, :, :, zz_torch] = coeffs_zz
+        coeffs = coeffs_flat.reshape(
+            coeffs_flat.shape[0],
+            local_nph * local_npw,
+            self.C,
+            self.block_size,
+            self.block_size,
+        )
+        canvas = block_idct2d(coeffs, local_nph, local_npw)
+        crops = []
+        for b, (top, left, height, width) in enumerate(crop_params):
+            row0, col0, _row1, _col1 = rects[b]
+            local_top = int(top) - int(row0) * self.block_size
+            local_left = int(left) - int(col0) * self.block_size
+            local_bottom = min(local_top + int(height), canvas.shape[-2])
+            local_right = min(local_left + int(width), canvas.shape[-1])
+            crop = canvas[b:b + 1, :, local_top:local_bottom, local_left:local_right]
+            crop = TF.resize(
+                crop,
+                [self.output_size, self.output_size],
+                interpolation=TF.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            crops.append(crop)
+        x = torch.cat(crops, dim=0).clamp_(0.0, 1.0)
+        return x.to(self.device, non_blocking=True)
+
     @torch.no_grad()
     def serve_indices(self, indices, crop_params=None, deterministic_val=False):
-        coeffs_zz, crop_params, visible_mask, k_alloc, bucket_id = self.read_coeffs(
+        coeffs_zz, crop_params, visible_mask, k_alloc, bucket_id, rects, local_nph, local_npw = self.read_crop_coeffs(
             indices, crop_params=crop_params, deterministic_val=deterministic_val
         )
-        x = self.reconstruct_crops(coeffs_zz, indices, crop_params, bucket_id)
+        x = self.reconstruct_local_crops(coeffs_zz, crop_params, rects, local_nph, local_npw)
         return x, crop_params, visible_mask, k_alloc, bucket_id
 
     def get_io_ratio(self) -> float:
