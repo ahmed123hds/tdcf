@@ -161,12 +161,14 @@ class OriginalQuantizedDCTStore:
         output_size: int = 224,
         crop_scale=(0.08, 1.0),
         crop_ratio=(3.0 / 4.0, 4.0 / 3.0),
+        max_crop_size: Optional[int] = None,
     ):
         self.root = root
         self.device = device or torch.device("cpu")
         self.output_size = int(output_size)
         self.crop_scale = crop_scale
         self.crop_ratio = crop_ratio
+        self.max_crop_size = int(max_crop_size) if max_crop_size is not None else None
 
         with open(os.path.join(root, "metadata.json")) as f:
             self.meta = json.load(f)
@@ -301,6 +303,23 @@ class OriginalQuantizedDCTStore:
         params = np.zeros((len(local_positions), 4), dtype=np.int64)
         for row, local_idx in enumerate(local_positions):
             h, w = bucket.sample_shapes[local_idx]
+            if self.max_crop_size is not None:
+                crop_h = min(int(h), self.max_crop_size)
+                crop_w = min(int(w), self.max_crop_size)
+                if deterministic_val:
+                    top = max((int(h) - crop_h) // 2, 0)
+                    left = max((int(w) - crop_w) // 2, 0)
+                else:
+                    max_top = max(int(h) - crop_h, 0)
+                    max_left = max(int(w) - crop_w, 0)
+                    top = random.randint(0, max_top) if max_top > 0 else 0
+                    left = random.randint(0, max_left) if max_left > 0 else 0
+                    # Block-align crop starts so physical reads map cleanly to
+                    # DCT blocks without expanding by another partial block.
+                    top = (top // self.block_size) * self.block_size
+                    left = (left // self.block_size) * self.block_size
+                params[row] = (top, left, crop_h, crop_w)
+                continue
             if deterministic_val:
                 crop = min(int(h), int(w))
                 top = max((int(h) - crop) // 2, 0)

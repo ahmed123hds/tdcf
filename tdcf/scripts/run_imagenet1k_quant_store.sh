@@ -108,6 +108,7 @@ while [ "$attempt" -lt "$MAX_RETRIES" ]; do
         --warmup_epochs "${WARMUP_EPOCHS:-5}" \
         --label_smooth "${LABEL_SMOOTH:-0.1}" \
         --grad_clip "${GRAD_CLIP:-1.0}" \
+        --max_crop_size "${MAX_CROP_SIZE:-224}" \
         --amp_bf16 \
         --budget_mode \
         --beta "$BETA" \

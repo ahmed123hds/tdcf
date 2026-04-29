@@ -116,6 +116,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--max_crop_size", type=int, default=224,
+                   help="Bound quant-store crop windows before resize; use <=0 for full RandomResizedCrop.")
     return p.parse_args()
 
 
@@ -193,6 +195,7 @@ def train_process(index, args):
         os.path.join(args.data_dir, "train"),
         device=device,
         output_size=args.img_size,
+        max_crop_size=args.max_crop_size if args.max_crop_size > 0 else None,
     )
     if is_master:
         print(
@@ -206,6 +209,7 @@ def train_process(index, args):
         os.path.join(args.data_dir, "val"),
         device=device,
         output_size=args.img_size,
+        max_crop_size=args.max_crop_size if args.max_crop_size > 0 else None,
     )
     if is_master:
         print(
@@ -261,6 +265,7 @@ def train_process(index, args):
         print(
             f"TDCF ImageNet-1K Quantized Store | backbone={args.backbone} | "
             f"buckets={len(train_store.bucket_infos)} crop={args.img_size} "
+            f"max_crop={args.max_crop_size} "
             f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
             flush=True,
         )
