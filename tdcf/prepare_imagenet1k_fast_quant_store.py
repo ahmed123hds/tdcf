@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import re
 import time
 
 import numpy as np
@@ -41,6 +42,29 @@ def identity_label(label):
     return int(label)
 
 
+def _expand_shard_range(pattern: str):
+    m = re.search(r"\{(\d+)\.\.(\d+)\}", pattern)
+    if not m:
+        return [pattern]
+    start_s, end_s = m.group(1), m.group(2)
+    width = max(len(start_s), len(end_s))
+    start, end = int(start_s), int(end_s)
+    if end < start:
+        raise ValueError(f"Invalid shard brace range: {pattern}")
+    return [
+        pattern[:m.start()] + f"{i:0{width}d}" + pattern[m.end():]
+        for i in range(start, end + 1)
+    ]
+
+
+def expand_shards(pattern: str):
+    urls = []
+    for item in (x.strip() for x in pattern.split(",")):
+        if item:
+            urls.extend(_expand_shard_range(item))
+    return urls
+
+
 def fixed_view(img, view_size: int):
     if not torch.is_tensor(img):
         img = img.convert("RGB")
@@ -70,8 +94,9 @@ def build_loader(args):
     def pre_transform(img):
         return fixed_view(img, args.view_size)
 
+    urls = expand_shards(args.shards)
     dataset = (
-        wds.WebDataset(args.shards, resampled=False, shardshuffle=False)
+        wds.WebDataset(urls, resampled=False, shardshuffle=False)
         .decode("pil")
         .to_tuple("jpg;jpeg;png", "cls")
         .map_tuple(pre_transform, identity_label)
