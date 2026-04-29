@@ -26,7 +26,7 @@ def parse_args():
     p.add_argument("--num_bands", type=int, default=16)
     p.add_argument("--records_per_shard", type=int, default=8192)
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--max_samples", type=int, default=0)
     p.add_argument("--calibration_samples", type=int, default=4096)
@@ -229,6 +229,11 @@ def write_batch(args, device, arrays, local_start, images, scales):
 def build_store(args):
     if args.view_size % args.block_size != 0:
         raise ValueError("--view_size must be divisible by --block_size")
+    if args.source == "webdataset" and args.num_workers != 0:
+        raise ValueError(
+            "Fast offline store construction currently requires --num_workers 0 "
+            "to preserve deterministic image-label ordering. Rebuild with NUM_WORKERS=0."
+        )
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)

@@ -21,7 +21,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-8}"
 NUM_BANDS="${NUM_BANDS:-16}"
 RECORDS_PER_SHARD="${RECORDS_PER_SHARD:-8192}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
 CALIBRATION_SAMPLES="${CALIBRATION_SAMPLES:-4096}"
 QUANT_MULTIPLIER="${QUANT_MULTIPLIER:-1.05}"
 DEVICE="${DEVICE:-cpu}"
@@ -30,6 +30,7 @@ mkdir -p "$OUT_ROOT"
 
 echo "[fast-prep] Building train store at $OUT_ROOT/train"
 echo "[fast-prep] train shards: $TRAIN_SHARDS"
+echo "[fast-prep] num_workers: $NUM_WORKERS (offline store order must be deterministic)"
 python3 -m tdcf.prepare_imagenet1k_fast_quant_store \
   --source webdataset \
   --shards "$TRAIN_SHARDS" \
