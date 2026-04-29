@@ -381,13 +381,17 @@ def train_process(index, args):
         train_start = time.time()
         step_start = time.time()
         for step, (indices, labels) in enumerate(train_loader):
+            iter_start = time.time()
             idx_np = indices.numpy()
             labels = labels.to(device)
+            data_start = time.time()
             x, _crop, _visible, _k, _bucket_id = train_store.serve_indices(idx_np, deterministic_val=False)
+            data_time = time.time() - data_start
 
             if step == 0 and is_master:
                 print("  -> Got first batch from quantized store! Building XLA graph...", flush=True)
 
+            compute_start = time.time()
             opt.zero_grad(set_to_none=True)
             with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                 logits = model(x)
@@ -399,9 +403,12 @@ def train_process(index, args):
             xm.optimizer_step(opt)
 
             batch_n = labels.size(0)
-            tr_loss_accum += loss.item() * batch_n
+            loss_value = loss.item()
+            tr_loss_accum += loss_value * batch_n
             tr_corr_accum += (logits.argmax(1) == labels).sum().item()
             tr_n_accum += batch_n
+            compute_time = time.time() - compute_start
+            iter_time = time.time() - iter_start
 
             if is_master:
                 if step == 0:
@@ -409,10 +416,18 @@ def train_process(index, args):
                     print(
                         f"  [Train] Epoch {ep+1} | Step {step:4d}/{len(train_loader)} | "
                         f"Time: {elapsed:.2f}s | {global_bs / max(elapsed, 1e-6):.1f} imgs/sec | "
-                        f"Loss: {loss.item():.4f}",
+                        f"data={data_time:.2f}s compute={compute_time:.2f}s | "
+                        f"Loss: {loss_value:.4f}",
                         flush=True,
                     )
                     step_start = time.time()
+                elif step < 10:
+                    print(
+                        f"  [Train] Epoch {ep+1} | Step {step:4d}/{len(train_loader)} | "
+                        f"Time: {iter_time:.2f}s | data={data_time:.2f}s compute={compute_time:.2f}s | "
+                        f"{global_bs / max(iter_time, 1e-6):.1f} imgs/sec",
+                        flush=True,
+                    )
                 elif (step < 100 and step % 10 == 0) or step % 100 == 0:
                     elapsed = time.time() - step_start
                     interval = 10 if step < 100 else 100

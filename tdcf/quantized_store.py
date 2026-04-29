@@ -129,8 +129,8 @@ class BucketBatchSampler(Sampler[List[int]]):
             rng.shuffle(bucket_ids)
         for bucket_id in bucket_ids:
             local = self._indices_by_bucket[bucket_id].copy()
-            if self.shuffle:
-                rng.shuffle(local)
+            # Keep samples contiguous within a bucket so batches hit a small
+            # number of compressed storage chunks; shuffle the batch order below.
             if self.drop_last:
                 local = local[: (len(local) // self.batch_size) * self.batch_size]
             for start in range(0, len(local), self.batch_size):
