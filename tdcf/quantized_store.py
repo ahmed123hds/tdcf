@@ -77,7 +77,8 @@ class QuantBucketInfo:
     lengths: np.ndarray
     raw_lengths: np.ndarray
     patch_signal: np.ndarray
-    band_files: List
+    band_paths: List[str]
+    band_files: Dict[int, object]
 
 
 class QuantizedDCTDataset(Dataset):
@@ -198,10 +199,6 @@ class OriginalQuantizedDCTStore:
             bucket_dir = os.path.join(root, bucket_meta["dir"])
             nph = int(bucket_meta["nph"])
             npw = int(bucket_meta["npw"])
-            band_files = [
-                open(os.path.join(bucket_dir, f"band_{band:02d}.bin"), "rb")
-                for band in range(self.num_bands)
-            ]
             self.bucket_infos[bucket_id] = QuantBucketInfo(
                 bucket_id=bucket_id,
                 bucket_dir=bucket_dir,
@@ -219,7 +216,11 @@ class OriginalQuantizedDCTStore:
                 lengths=np.load(os.path.join(bucket_dir, "lengths.npy"), mmap_mode="r"),
                 raw_lengths=np.load(os.path.join(bucket_dir, "raw_lengths.npy"), mmap_mode="r"),
                 patch_signal=np.load(os.path.join(bucket_dir, "patch_signal.npy"), mmap_mode="r"),
-                band_files=band_files,
+                band_paths=[
+                    os.path.join(bucket_dir, f"band_{band:02d}.bin")
+                    for band in range(self.num_bands)
+                ],
+                band_files={},
             )
 
         self.mode = "full"
@@ -234,8 +235,16 @@ class OriginalQuantizedDCTStore:
 
     def close(self):
         for bucket in self.bucket_infos.values():
-            for handle in bucket.band_files:
+            for handle in bucket.band_files.values():
                 handle.close()
+            bucket.band_files.clear()
+
+    def _get_band_file(self, bucket: QuantBucketInfo, band_index: int):
+        handle = bucket.band_files.get(band_index)
+        if handle is None or handle.closed:
+            handle = open(bucket.band_paths[band_index], "rb")
+            bucket.band_files[band_index] = handle
+        return handle
 
     def reset_epoch_io(self):
         self.bytes_read_epoch = 0
@@ -359,7 +368,7 @@ class OriginalQuantizedDCTStore:
         offset = int(bucket.offsets[chunk_id, tile_index, band_index])
         length = int(bucket.lengths[chunk_id, tile_index, band_index])
         raw_length = int(bucket.raw_lengths[chunk_id, tile_index, band_index])
-        handle = bucket.band_files[band_index]
+        handle = self._get_band_file(bucket, band_index)
         handle.seek(offset)
         payload = handle.read(length)
         raw = zlib.decompress(payload)

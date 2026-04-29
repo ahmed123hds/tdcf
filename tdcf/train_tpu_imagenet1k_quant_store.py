@@ -186,8 +186,20 @@ def train_process(index, args):
     np.random.seed(seed)
     random.seed(seed)
 
-    train_store = OriginalQuantizedDCTStore(os.path.join(args.data_dir, "train"), device=device, output_size=args.img_size)
-    val_store = OriginalQuantizedDCTStore(os.path.join(args.data_dir, "val"), device=device, output_size=args.img_size)
+    if is_master:
+        print("[INIT] Opening quantized train store...", flush=True)
+    train_store = OriginalQuantizedDCTStore(
+        os.path.join(args.data_dir, "train"),
+        device=device,
+        output_size=args.img_size,
+    )
+    if is_master:
+        print("[INIT] Opening quantized val store...", flush=True)
+    val_store = OriginalQuantizedDCTStore(
+        os.path.join(args.data_dir, "val"),
+        device=device,
+        output_size=args.img_size,
+    )
     train_loader, train_sampler = make_loader(
         train_store, args.batch_size, world_size, rank, True, True, args.seed
     )
@@ -445,4 +457,4 @@ def train_process_entry(index, args):
 if __name__ == "__main__":
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
-    xmp.spawn(train_process_entry, args=(args,), nprocs=8, start_method="spawn")
+    xmp.spawn(train_process_entry, args=(args,), start_method="spawn")
