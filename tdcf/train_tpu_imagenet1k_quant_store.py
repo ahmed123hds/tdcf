@@ -419,18 +419,10 @@ def train_process(index, args):
                     print(
                         f"  [Train] Epoch {ep+1} | Step {step:4d}/{len(train_loader)} | "
                         f"Time: {elapsed:.2f}s | {global_bs / max(elapsed, 1e-6):.1f} imgs/sec | "
-                        f"data={data_time:.2f}s sync_compute={compute_time:.2f}s | "
                         f"Loss: {loss_value:.4f}",
                         flush=True,
                     )
                     step_start = time.time()
-                elif step < 10:
-                    print(
-                        f"  [Train] Epoch {ep+1} | Step {step:4d}/{len(train_loader)} | "
-                        f"Time: {iter_time:.2f}s | data={data_time:.2f}s dispatch={compute_time:.2f}s | "
-                        f"{global_bs / max(iter_time, 1e-6):.1f} imgs/sec",
-                        flush=True,
-                    )
                 elif (step < 100 and step % 10 == 0) or step % 100 == 0:
                     elapsed = time.time() - step_start
                     interval = 10 if step < 100 else 100
