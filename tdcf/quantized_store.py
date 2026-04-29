@@ -577,9 +577,25 @@ class OriginalQuantizedDCTStore:
         local_nph: int,
         local_npw: int,
     ):
-        # XLA recompiles aggressively for variable crop-grid shapes. Keep the
-        # variable-size inverse DCT on CPU, then transfer fixed 224x224 images.
-        work_device = torch.device("cpu") if self.device.type == "xla" else self.device
+        crop_params = np.asarray(crop_params, dtype=np.int64)
+        fixed_blocks = self.output_size // self.block_size
+        local_tops = crop_params[:, 0] - rects[:, 0] * self.block_size
+        local_lefts = crop_params[:, 1] - rects[:, 1] * self.block_size
+        use_xla_fixed_crop = (
+            self.device.type == "xla"
+            and self.output_size % self.block_size == 0
+            and local_nph == fixed_blocks
+            and local_npw == fixed_blocks
+            and np.all(crop_params[:, 2] == self.output_size)
+            and np.all(crop_params[:, 3] == self.output_size)
+            and np.all(local_tops == 0)
+            and np.all(local_lefts == 0)
+        )
+        # XLA recompiles aggressively for variable crop-grid shapes. Use TPU
+        # only for the common fixed 224x224 path; keep rare variable crops on CPU.
+        work_device = self.device if use_xla_fixed_crop else (
+            torch.device("cpu") if self.device.type == "xla" else self.device
+        )
         coeffs_zz = coeffs_zz.to(work_device, non_blocking=True)
         zz_torch = self._get_zz_torch(coeffs_zz.device)
         coeffs_flat = torch.zeros_like(coeffs_zz, device=work_device)
@@ -592,6 +608,8 @@ class OriginalQuantizedDCTStore:
             self.block_size,
         )
         canvas = block_idct2d(coeffs, local_nph, local_npw)
+        if use_xla_fixed_crop:
+            return canvas.clamp_(0.0, 1.0)
         crops = []
         for b, (top, left, height, width) in enumerate(crop_params):
             row0, col0, _row1, _col1 = rects[b]
