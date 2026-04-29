@@ -190,7 +190,6 @@ def train_process(index, args):
         val_store.set_full_fidelity()
         train_store.reset_epoch_io()
         model.train()
-        tr_loss_accum = tr_corr_accum = tr_n_accum = 0.0
         tr_loss_t = torch.zeros(1, device=device)
         tr_corr_t = torch.zeros(1, device=device)
         tr_n_t = torch.zeros(1, device=device)
@@ -218,6 +217,7 @@ def train_process(index, args):
             tr_loss_t.add_(loss.detach() * batch_n)
             tr_corr_t.add_((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
             tr_n_t.add_(batch_n)
+            xm.mark_step()
 
             if is_master:
                 if step == 0:
@@ -239,14 +239,9 @@ def train_process(index, args):
                     )
                     step_start = time.time()
 
-            if step % 100 == 0 or step == len(train_loader) - 1:
-                tr_loss_accum += tr_loss_t.item()
-                tr_corr_accum += tr_corr_t.item()
-                tr_n_accum += tr_n_t.item()
-                tr_loss_t.zero_()
-                tr_corr_t.zero_()
-                tr_n_t.zero_()
-
+        tr_loss_accum = tr_loss_t.item()
+        tr_corr_accum = tr_corr_t.item()
+        tr_n_accum = tr_n_t.item()
         tr_n_total = xm.mesh_reduce(f"fastq_tr_n_{ep}", tr_n_accum, sum)
         tr_corr_total = xm.mesh_reduce(f"fastq_tr_corr_{ep}", tr_corr_accum, sum)
         tr_loss_total = xm.mesh_reduce(f"fastq_tr_loss_{ep}", tr_loss_accum, sum)
@@ -272,6 +267,7 @@ def train_process(index, args):
                 va_loss_t.add_(loss.detach() * batch_n)
                 va_corr_t.add_((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
                 va_n_t.add_(batch_n)
+                xm.mark_step()
                 if val_step % 100 == 0 or val_step == len(val_loader) - 1:
                     va_loss_accum += va_loss_t.item()
                     va_corr_accum += va_corr_t.item()
