@@ -378,6 +378,9 @@ def train_process(index, args):
         train_store.reset_epoch_io()
         model.train()
         tr_loss_accum = tr_corr_accum = tr_n_accum = 0.0
+        tr_loss_t = torch.zeros(1, device=device)
+        tr_corr_t = torch.zeros(1, device=device)
+        tr_n_t = torch.zeros(1, device=device)
         train_start = time.time()
         step_start = time.time()
         for step, (indices, labels) in enumerate(train_loader):
@@ -402,21 +405,21 @@ def train_process(index, args):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             xm.optimizer_step(opt)
 
-            batch_n = labels.size(0)
-            loss_value = loss.item()
-            tr_loss_accum += loss_value * batch_n
-            tr_corr_accum += (logits.argmax(1) == labels).sum().item()
-            tr_n_accum += batch_n
+            batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
+            tr_loss_t.add_(loss.detach() * batch_n)
+            tr_corr_t.add_((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
+            tr_n_t.add_(batch_n)
             compute_time = time.time() - compute_start
             iter_time = time.time() - iter_start
 
             if is_master:
                 if step == 0:
+                    loss_value = loss.item()
                     elapsed = time.time() - step_start
                     print(
                         f"  [Train] Epoch {ep+1} | Step {step:4d}/{len(train_loader)} | "
                         f"Time: {elapsed:.2f}s | {global_bs / max(elapsed, 1e-6):.1f} imgs/sec | "
-                        f"data={data_time:.2f}s compute={compute_time:.2f}s | "
+                        f"data={data_time:.2f}s sync_compute={compute_time:.2f}s | "
                         f"Loss: {loss_value:.4f}",
                         flush=True,
                     )
@@ -424,7 +427,7 @@ def train_process(index, args):
                 elif step < 10:
                     print(
                         f"  [Train] Epoch {ep+1} | Step {step:4d}/{len(train_loader)} | "
-                        f"Time: {iter_time:.2f}s | data={data_time:.2f}s compute={compute_time:.2f}s | "
+                        f"Time: {iter_time:.2f}s | data={data_time:.2f}s dispatch={compute_time:.2f}s | "
                         f"{global_bs / max(iter_time, 1e-6):.1f} imgs/sec",
                         flush=True,
                     )
@@ -439,6 +442,14 @@ def train_process(index, args):
                     )
                     step_start = time.time()
 
+            if step % 100 == 0 or step == len(train_loader) - 1:
+                tr_loss_accum += tr_loss_t.item()
+                tr_corr_accum += tr_corr_t.item()
+                tr_n_accum += tr_n_t.item()
+                tr_loss_t.zero_()
+                tr_corr_t.zero_()
+                tr_n_t.zero_()
+
         tr_n_total = xm.mesh_reduce(f"qstore_tr_n_{ep}", tr_n_accum, sum)
         tr_corr_total = xm.mesh_reduce(f"qstore_tr_corr_{ep}", tr_corr_accum, sum)
         tr_loss_total = xm.mesh_reduce(f"qstore_tr_loss_{ep}", tr_loss_accum, sum)
@@ -449,19 +460,29 @@ def train_process(index, args):
         val_store.reset_epoch_io()
         model.eval()
         va_loss_accum = va_corr_accum = va_n_accum = 0.0
+        va_loss_t = torch.zeros(1, device=device)
+        va_corr_t = torch.zeros(1, device=device)
+        va_n_t = torch.zeros(1, device=device)
         val_start = time.time()
         with torch.no_grad():
-            for indices, labels in val_loader:
+            for val_step, (indices, labels) in enumerate(val_loader):
                 idx_np = indices.numpy()
                 labels = labels.to(device)
                 x, _crop, _visible, _k, _bucket_id = val_store.serve_indices(idx_np, deterministic_val=True)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
                     loss = criterion(logits, labels)
-                batch_n = labels.size(0)
-                va_loss_accum += loss.item() * batch_n
-                va_corr_accum += (logits.argmax(1) == labels).sum().item()
-                va_n_accum += batch_n
+                batch_n = torch.tensor([labels.size(0)], device=device, dtype=torch.float32)
+                va_loss_t.add_(loss.detach() * batch_n)
+                va_corr_t.add_((logits.argmax(1) == labels).sum().to(dtype=torch.float32).view(1))
+                va_n_t.add_(batch_n)
+                if val_step % 100 == 0 or val_step == len(val_loader) - 1:
+                    va_loss_accum += va_loss_t.item()
+                    va_corr_accum += va_corr_t.item()
+                    va_n_accum += va_n_t.item()
+                    va_loss_t.zero_()
+                    va_corr_t.zero_()
+                    va_n_t.zero_()
 
         va_n_total = xm.mesh_reduce(f"qstore_va_n_{ep}", va_n_accum, sum)
         va_corr_total = xm.mesh_reduce(f"qstore_va_corr_{ep}", va_corr_accum, sum)
