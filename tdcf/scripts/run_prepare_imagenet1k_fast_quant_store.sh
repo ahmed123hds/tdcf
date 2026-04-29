@@ -9,8 +9,12 @@ REPO_ROOT="$(cd "${PACKAGE_ROOT}/.." && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-TRAIN_SHARDS="${TRAIN_SHARDS:-/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar}"
-VAL_SHARDS="${VAL_SHARDS:-/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar}"
+if [[ -z "${TRAIN_SHARDS:-}" ]]; then
+  TRAIN_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar'
+fi
+if [[ -z "${VAL_SHARDS:-}" ]]; then
+  VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar'
+fi
 OUT_ROOT="${OUT_ROOT:-/mnt/dataset_disk/imagenet1k_fast_quant_dct_224}"
 VIEW_SIZE="${VIEW_SIZE:-224}"
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
