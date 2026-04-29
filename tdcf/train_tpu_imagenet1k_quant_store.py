@@ -423,9 +423,9 @@ def train_process(index, args):
                         flush=True,
                     )
                     step_start = time.time()
-                elif (step < 100 and step % 10 == 0) or step % 100 == 0:
+                elif step % 100 == 0:
                     elapsed = time.time() - step_start
-                    interval = 10 if step < 100 else 100
+                    interval = 100
                     print(
                         f"  [Train] Epoch {ep+1} | Step {step:4d}/{len(train_loader)} | "
                         f"Time for {interval} steps: {elapsed:.2f}s | "
