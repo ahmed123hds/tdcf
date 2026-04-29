@@ -84,12 +84,15 @@ class FastShardBatchSampler(Sampler[List[int]]):
 
     def __iter__(self):
         batches = self._all_batches()
+        usable = (len(batches) // self.num_replicas) * self.num_replicas
+        batches = batches[:usable]
         for batch in batches[self.rank::self.num_replicas]:
             yield batch
 
     def __len__(self):
         total = len(self._all_batches())
-        return math.ceil(max(total - self.rank, 0) / self.num_replicas)
+        usable = (total // self.num_replicas) * self.num_replicas
+        return usable // self.num_replicas
 
 
 class FastQuantizedDCTStore:
