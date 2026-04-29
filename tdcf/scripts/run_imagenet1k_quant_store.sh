@@ -33,36 +33,46 @@ case "$MODE" in
         BETA="${BETA:-1.0}"
         MAX_BETA="${MAX_BETA:-1.0}"
         GAMMA="${GAMMA:-1.0}"
+        SKIP_PILOT_DEFAULT=1
         ;;
     cap90)
         SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_quant_store_cap90}"
         BETA="${BETA:-0.6}"
         MAX_BETA="${MAX_BETA:-0.9}"
         GAMMA="${GAMMA:-1.0}"
+        SKIP_PILOT_DEFAULT=0
         ;;
     cap80)
         SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_quant_store_cap80}"
         BETA="${BETA:-0.6}"
         MAX_BETA="${MAX_BETA:-0.8}"
         GAMMA="${GAMMA:-1.0}"
+        SKIP_PILOT_DEFAULT=0
         ;;
     cap70)
         SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_quant_store_cap70}"
         BETA="${BETA:-0.55}"
         MAX_BETA="${MAX_BETA:-0.7}"
         GAMMA="${GAMMA:-1.0}"
+        SKIP_PILOT_DEFAULT=0
         ;;
     cap60)
         SAVE_DIR="${SAVE_DIR:-./results/imagenet1k_quant_store_cap60}"
         BETA="${BETA:-0.5}"
         MAX_BETA="${MAX_BETA:-0.6}"
         GAMMA="${GAMMA:-1.0}"
+        SKIP_PILOT_DEFAULT=0
         ;;
     *)
         echo "Unknown mode: $MODE"
         exit 2
         ;;
 esac
+
+EXTRA_FLAGS=()
+if [ "${SKIP_PILOT:-$SKIP_PILOT_DEFAULT}" = "1" ]; then
+    EXTRA_FLAGS+=(--skip_pilot)
+fi
 
 mkdir -p "$SAVE_DIR"
 mkdir -p logs
@@ -107,6 +117,7 @@ while [ "$attempt" -lt "$MAX_RETRIES" ]; do
         --patch_policy "${PATCH_POLICY:-greedy}" \
         --save_dir "$SAVE_DIR" \
         $RESUME_FLAG \
+        "${EXTRA_FLAGS[@]}" \
         2>&1 | tee -a "logs/quant_store_${MODE}_attempt_${attempt}.log" \
     && break
 

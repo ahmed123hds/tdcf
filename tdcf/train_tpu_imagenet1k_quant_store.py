@@ -257,26 +257,36 @@ def train_process(index, args):
         print(f"[INIT] Model ready in {time.time() - init_start:.1f}s", flush=True)
 
     if is_master:
-        print("=" * 72)
+        print("=" * 72, flush=True)
         print(
             f"TDCF ImageNet-1K Quantized Store | backbone={args.backbone} | "
             f"buckets={len(train_store.bucket_infos)} crop={args.img_size} "
-            f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}"
+            f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
+            flush=True,
         )
-        print("=" * 72)
+        print("=" * 72, flush=True)
 
     if not args.skip_pilot:
         if is_master:
-            print(f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, ~{pilot_steps} steps/epoch")
+            print(
+                f"\n[PILOT PHASE] - {args.pilot_epochs} epochs, ~{pilot_steps} steps/epoch",
+                flush=True,
+            )
         train_store.set_full_fidelity()
         for ep in range(args.pilot_epochs):
             epoch_start = time.time()
+            step_start = time.time()
             train_sampler.set_epoch(ep)
             pilot_stats.begin_epoch()
             model.train()
             for step, (indices, labels) in enumerate(train_loader):
                 if step >= pilot_steps:
                     break
+                if is_master and step == 0:
+                    print(
+                        f"  [Pilot] Epoch {ep+1} | Step {step:4d}/{pilot_steps} | reading quantized store...",
+                        flush=True,
+                    )
                 idx_np = indices.numpy()
                 labels = labels.to(device)
                 coeffs_zz, crop_params, _visible, _k, bucket_id = train_store.read_coeffs(idx_np)
@@ -294,6 +304,15 @@ def train_process(index, args):
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 xm.optimizer_step(pilot_opt)
+                if is_master and (step == 0 or (step + 1) % 25 == 0):
+                    elapsed = time.time() - step_start
+                    done = step + 1
+                    print(
+                        f"  [Pilot] Epoch {ep+1} | Step {done:4d}/{pilot_steps} | "
+                        f"{elapsed:.1f}s for last {done if step == 0 else 25} steps",
+                        flush=True,
+                    )
+                    step_start = time.time()
             pilot_stats.finalize_epoch()
             if is_master:
                 bs = pilot_stats.band_sensitivity_history[-1]
@@ -307,11 +326,11 @@ def train_process(index, args):
             scheduler.fit_from_pilot(pilot_stats, args.epochs)
         if is_master:
             if scheduler is not None:
-                print(scheduler.summary())
-            print("\n[ADAPTIVE TRAINING PHASE]")
+                print(scheduler.summary(), flush=True)
+            print("\n[ADAPTIVE TRAINING PHASE]", flush=True)
     else:
         if is_master:
-            print("\n[SKIP PILOT] - Proceeding directly to quantized-store baseline.")
+            print("\n[SKIP PILOT] - Proceeding directly to quantized-store baseline.", flush=True)
 
     opt = make_optimizer(args, model, scaled_lr)
     sched_lr = make_scheduler(args, opt)
