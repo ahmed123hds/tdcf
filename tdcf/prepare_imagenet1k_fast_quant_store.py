@@ -65,6 +65,23 @@ def expand_shards(pattern: str):
     return urls
 
 
+def validate_expanded_shards(raw_pattern: str, urls: list[str]):
+    if not urls:
+        raise ValueError(f"No shards expanded from pattern: {raw_pattern!r}")
+    bad = [u for u in urls if "{" in u or "}" in u]
+    if bad:
+        raise ValueError(
+            "Shard pattern still contains braces after expansion. "
+            f"raw={raw_pattern!r} first_bad={bad[0]!r}. "
+            "Expected format like imagenet1k-train-{0000..1023}.tar"
+        )
+    if not os.path.exists(urls[0]):
+        raise FileNotFoundError(
+            f"First expanded shard does not exist: {urls[0]!r}. "
+            f"raw pattern was: {raw_pattern!r}"
+        )
+
+
 def fixed_view(img, view_size: int):
     if not torch.is_tensor(img):
         img = img.convert("RGB")
@@ -95,6 +112,12 @@ def build_loader(args):
         return fixed_view(img, args.view_size)
 
     urls = expand_shards(args.shards)
+    validate_expanded_shards(args.shards, urls)
+    print(
+        f"[fast-quant] shards expanded: count={len(urls)} "
+        f"first={urls[0]} last={urls[-1]}",
+        flush=True,
+    )
     dataset = (
         wds.WebDataset(urls, resampled=False, shardshuffle=False)
         .decode("pil")

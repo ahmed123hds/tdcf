@@ -25,6 +25,7 @@ DEVICE="${DEVICE:-cpu}"
 mkdir -p "$OUT_ROOT"
 
 echo "[fast-prep] Building train store at $OUT_ROOT/train"
+echo "[fast-prep] train shards: $TRAIN_SHARDS"
 python3 -m tdcf.prepare_imagenet1k_fast_quant_store \
   --source webdataset \
   --shards "$TRAIN_SHARDS" \
@@ -41,6 +42,7 @@ python3 -m tdcf.prepare_imagenet1k_fast_quant_store \
   ${MAX_SAMPLES:+--max_samples "$MAX_SAMPLES"}
 
 echo "[fast-prep] Building val store at $OUT_ROOT/val"
+echo "[fast-prep] val shards: $VAL_SHARDS"
 python3 -m tdcf.prepare_imagenet1k_fast_quant_store \
   --source webdataset \
   --shards "$VAL_SHARDS" \
