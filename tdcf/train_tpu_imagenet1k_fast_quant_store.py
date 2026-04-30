@@ -59,6 +59,7 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--label_smooth", type=float, default=0.1)
     p.add_argument("--amp_bf16", action="store_true")
+    p.add_argument("--crop_device", choices=["cpu", "xla"], default="cpu")
     p.add_argument("--budget_mode", action="store_true")
     p.add_argument("--beta", type=float, default=1.0)
     p.add_argument("--max_beta", type=float, default=1.0)
@@ -157,10 +158,11 @@ def train_process(index, args):
 
     if is_master:
         print("[INIT] Opening fast quantized train store...", flush=True)
-    train_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "train"), device=device)
+    store_device = torch.device("cpu") if args.crop_device == "cpu" else device
+    train_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "train"), device=store_device)
     if is_master:
         print("[INIT] Opening fast quantized val store...", flush=True)
-    val_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "val"), device=device)
+    val_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "val"), device=store_device)
 
     train_loader, train_sampler = make_loader(
         train_store, args.batch_size, world_size, rank, True, True, args.seed
@@ -195,7 +197,7 @@ def train_process(index, args):
         print(
             f"TDCF ImageNet-1K Fast Quant Store | backbone={args.backbone} | "
             f"view={train_store.view_size} img={args.img_size} bands={train_store.num_bands} "
-            f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
+            f"crop_device={args.crop_device} global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
             flush=True,
         )
         print("=" * 72, flush=True)
@@ -219,6 +221,8 @@ def train_process(index, args):
             labels = labels.to(device)
             x = train_store.serve_indices(idx_np)
             x = crop_batch(x, args.img_size, is_training=True)
+            if x.device != device:
+                x = x.to(device)
             if step == 0 and is_master:
                 print("  -> Got first batch from fast quant store! Warming XLA step...", flush=True)
 
@@ -287,6 +291,8 @@ def train_process(index, args):
                 labels = labels.to(device)
                 x = val_store.serve_indices(indices.numpy())
                 x = crop_batch(x, args.img_size, is_training=False)
+                if x.device != device:
+                    x = x.to(device)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
                     loss = criterion(logits, labels)

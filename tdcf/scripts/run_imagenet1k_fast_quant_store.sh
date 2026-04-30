@@ -89,6 +89,7 @@ while [ "$attempt" -lt "$MAX_RETRIES" ]; do
     --label_smooth "${LABEL_SMOOTH:-0.1}" \
     --grad_clip "${GRAD_CLIP:-1.0}" \
     --amp_bf16 \
+    --crop_device "${CROP_DEVICE:-cpu}" \
     --budget_mode \
     --beta "$BETA" \
     --max_beta "$MAX_BETA" \
