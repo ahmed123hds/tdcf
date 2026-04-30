@@ -78,6 +78,7 @@ while [ "$attempt" -lt "$MAX_RETRIES" ]; do
     --data_dir "$DATA_DIR" \
     --backbone resnet50 \
     --n_classes 1000 \
+    --img_size "${IMG_SIZE:-224}" \
     --batch_size "${BATCH_SIZE:-128}" \
     --eval_batch_size "${EVAL_BATCH_SIZE:-128}" \
     --epochs "${EPOCHS:-100}" \

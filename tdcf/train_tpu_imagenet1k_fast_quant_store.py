@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch_xla.distributed.xla_backend
+import torch.nn.functional as F
 import torchvision.models as tv_models
 
 import torch_xla.core.xla_model as xm
@@ -46,6 +47,7 @@ def parse_args():
     p.add_argument("--save_dir", type=str, default="./results/imagenet1k_fast_quant_store")
     p.add_argument("--backbone", choices=["resnet50", "vit_b16"], default="resnet50")
     p.add_argument("--n_classes", type=int, default=1000)
+    p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--eval_batch_size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=100)
@@ -65,6 +67,21 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--resume", action="store_true")
     return p.parse_args()
+
+
+def crop_batch(x: torch.Tensor, crop_size: int, is_training: bool) -> torch.Tensor:
+    _, _, h, w = x.shape
+    if crop_size <= 0 or (h == crop_size and w == crop_size):
+        return x
+    if crop_size > h or crop_size > w:
+        return F.interpolate(x, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+    if is_training:
+        top = random.randint(0, h - crop_size)
+        left = random.randint(0, w - crop_size)
+    else:
+        top = (h - crop_size) // 2
+        left = (w - crop_size) // 2
+    return x[:, :, top:top + crop_size, left:left + crop_size]
 
 
 def build_model(args, device, img_size):
@@ -154,7 +171,7 @@ def train_process(index, args):
 
     global_bs = args.batch_size * world_size
     scaled_lr = args.base_lr * (global_bs / float(args.lr_ref_batch))
-    model = build_model(args, device, train_store.view_size)
+    model = build_model(args, device, args.img_size)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
     opt = make_optimizer(args, model, scaled_lr)
     sched_lr = make_scheduler(args, opt)
@@ -177,7 +194,7 @@ def train_process(index, args):
         print("=" * 72, flush=True)
         print(
             f"TDCF ImageNet-1K Fast Quant Store | backbone={args.backbone} | "
-            f"view={train_store.view_size} bands={train_store.num_bands} "
+            f"view={train_store.view_size} img={args.img_size} bands={train_store.num_bands} "
             f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
             flush=True,
         )
@@ -201,8 +218,9 @@ def train_process(index, args):
             idx_np = indices.numpy()
             labels = labels.to(device)
             x = train_store.serve_indices(idx_np)
+            x = crop_batch(x, args.img_size, is_training=True)
             if step == 0 and is_master:
-                print("  -> Got first batch from fast quant store! Building XLA graph...", flush=True)
+                print("  -> Got first batch from fast quant store! Warming XLA step...", flush=True)
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
@@ -268,6 +286,7 @@ def train_process(index, args):
             for val_step, (indices, labels) in enumerate(val_loader):
                 labels = labels.to(device)
                 x = val_store.serve_indices(indices.numpy())
+                x = crop_batch(x, args.img_size, is_training=False)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
                     loss = criterion(logits, labels)
