@@ -33,11 +33,18 @@ def main():
         shutil.rmtree(args.out_dir)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    g = torch.Generator().manual_seed(7)
+    def make_image(height: int, width: int, phase: float) -> torch.Tensor:
+        yy = torch.linspace(0, 1, height).view(1, height, 1)
+        xx = torch.linspace(0, 1, width).view(1, 1, width)
+        r = (0.65 * xx + 0.25 * yy + 0.10 * torch.sin((xx + phase) * 8.0)).clamp(0, 1)
+        g = (0.35 * xx + 0.55 * yy + 0.10 * torch.cos((yy + phase) * 7.0)).clamp(0, 1)
+        b = (0.45 * (1 - xx) + 0.35 * yy + 0.08 * torch.sin((xx + yy) * 10.0)).clamp(0, 1)
+        return torch.cat([r.expand(1, height, width), g.expand(1, height, width), b.expand(1, height, width)])
+
     samples = [
-        (torch.rand(3, 96, 128, generator=g), 3),
-        (torch.rand(3, 111, 143, generator=g), 5),
-        (torch.rand(3, 160, 112, generator=g), 7),
+        (make_image(96, 128, 0.1), 3),
+        (make_image(111, 143, 0.4), 5),
+        (make_image(160, 112, 0.7), 7),
     ]
     writer = CropDCTWriter(
         args.out_dir,
@@ -65,7 +72,7 @@ def main():
         full_psnrs.append(psnr(crop.cpu().squeeze(0), src))
         assert got_label == label, (got_label, label)
     mean_psnr = sum(full_psnrs) / len(full_psnrs)
-    if mean_psnr < 35.0:
+    if mean_psnr < 40.0:
         raise AssertionError(f"CropDCT reconstruction PSNR too low: {mean_psnr:.2f} dB")
 
     crop_box = (16, 16, 64, 64)
@@ -85,6 +92,8 @@ def main():
     print("CropDCT smoke test passed")
     print(f"mean_full_reconstruction_psnr={mean_psnr:.2f} dB")
     print(f"full_read_bytes={full_stats['bytes_read']} low_band_read_bytes={low_stats['bytes_read']}")
+    print(f"full_stats={full_stats}")
+    print(f"low_band_stats={low_stats}")
     print("=" * 72)
     if not args.keep:
         shutil.rmtree(args.out_dir)

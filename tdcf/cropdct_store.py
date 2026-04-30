@@ -18,6 +18,7 @@ import math
 import os
 import random
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -89,13 +90,11 @@ def ycbcr_255_to_rgb(x: torch.Tensor) -> torch.Tensor:
 
 def pad_to_block(x: torch.Tensor, block_size: int) -> torch.Tensor:
     _, _, h, w = x.shape
-    hp = math.ceil(h / block_size) * block_size
-    wp = math.ceil(w / block_size) * block_size
-    if hp == h and wp == w:
+    pad_h = (block_size - h % block_size) % block_size
+    pad_w = (block_size - w % block_size) % block_size
+    if pad_h == 0 and pad_w == 0:
         return x
-    out = torch.zeros((x.shape[0], x.shape[1], hp, wp), dtype=x.dtype, device=x.device)
-    out[:, :, :h, :w] = x
-    return out
+    return F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
 
 
 def tile_specs(nph: int, npw: int, tile_blocks: int) -> List[dict]:
@@ -122,6 +121,11 @@ def tile_specs(nph: int, npw: int, tile_blocks: int) -> List[dict]:
             )
             tile_id += 1
     return out
+
+
+@lru_cache(maxsize=512)
+def cached_tile_specs(nph: int, npw: int, tile_blocks: int) -> Tuple[dict, ...]:
+    return tuple(tile_specs(nph, npw, tile_blocks))
 
 
 def tiles_overlapping_crop(
@@ -205,12 +209,24 @@ class CropDCTShard:
             self._payload.close()
             self._payload = None
 
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
     def read_chunk(self, chunk_index: int) -> bytes:
         rec = self.chunks[int(chunk_index)]
         f = self.open()
         f.seek(int(rec["offset"]))
         payload = f.read(int(rec["length"]))
         return self.codec.decompress(payload, int(rec["raw_length"]))
+
+    def read_span(self, start: int, end: int) -> bytes:
+        f = self.open()
+        f.seek(int(start))
+        return f.read(int(end) - int(start))
 
 
 class CropDCTStore:
@@ -234,23 +250,39 @@ class CropDCTStore:
             int(s["shard_id"]): CropDCTShard(root, s, self.codec)
             for s in self.meta["shards"]
         }
+        if len(self.shards) != len(self.meta["shards"]):
+            raise ValueError("CropDCT shard metadata is inconsistent")
+        self._full_image_bytes_cache: Dict[int, int] = {}
         self.reset_stats()
 
     def close(self):
         for shard in self.shards.values():
             shard.close()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
     def reset_stats(self):
         self.bytes_read = 0
-        self.full_bytes = 0
+        self.touched_full_band_bytes = 0
+        self.full_image_bytes = 0
         self.read_ops = 0
 
     def get_read_stats(self):
         return {
             "bytes_read": int(self.bytes_read),
-            "full_bytes": int(self.full_bytes),
+            "touched_full_band_bytes": int(self.touched_full_band_bytes),
+            "full_image_bytes": int(self.full_image_bytes),
             "read_ops": int(self.read_ops),
-            "io_ratio": 0.0 if self.full_bytes == 0 else self.bytes_read / self.full_bytes,
+            "crop_io_ratio": 0.0
+            if self.touched_full_band_bytes == 0
+            else self.bytes_read / self.touched_full_band_bytes,
+            "image_io_ratio": 0.0
+            if self.full_image_bytes == 0
+            else self.bytes_read / self.full_image_bytes,
         }
 
     def image_record(self, image_id: int) -> CropDCTImage:
@@ -273,18 +305,31 @@ class CropDCTStore:
     def _chunk_index(self, image: CropDCTImage, tile_id: int, band_id: int) -> int:
         return image.chunk_base + int(tile_id) * self.num_bands + int(band_id)
 
+    def _full_image_compressed_bytes(self, image: CropDCTImage) -> int:
+        cached = self._full_image_bytes_cache.get(image.image_id)
+        if cached is not None:
+            return cached
+        shard = self.shards[image.shard_id]
+        total = 0
+        for tile_id in range(image.num_tiles):
+            for band_id in range(self.num_bands):
+                total += int(shard.chunks[self._chunk_index(image, tile_id, band_id)]["length"])
+        self._full_image_bytes_cache[image.image_id] = total
+        return total
+
     def read_crop_coeffs(
         self,
         image_id: int,
         crop_box: Tuple[int, int, int, int],
         freq_bands: Sequence[int],
     ) -> Tuple[torch.Tensor, Tuple[int, int, int, int], CropDCTImage]:
+        freq_set = frozenset(int(x) for x in freq_bands)
         image = self.image_record(image_id)
         shard = self.shards[image.shard_id]
         tile_ids = tiles_overlapping_crop(
             image.nph, image.npw, self.block_size, self.tile_blocks, crop_box
         )
-        specs = tile_specs(image.nph, image.npw, self.tile_blocks)
+        specs = cached_tile_specs(image.nph, image.npw, self.tile_blocks)
 
         top, left, height, width = map(int, crop_box)
         row0 = max(0, top // self.block_size)
@@ -294,6 +339,7 @@ class CropDCTStore:
         local_nph = max(1, row1 - row0)
         local_npw = max(1, col1 - col0)
         coeffs_zz = np.zeros((local_nph * local_npw, 3, 64), dtype=np.float32)
+        self.full_image_bytes += self._full_image_compressed_bytes(image)
 
         for tile_id in tile_ids:
             spec = specs[int(tile_id)]
@@ -310,19 +356,33 @@ class CropDCTStore:
                 continue
             kept_cols = np.flatnonzero(keep)
             local_ids = (global_rows[keep] - row0) * local_npw + (global_cols[keep] - col0)
-            for band_id in range(self.num_bands):
-                chunk_idx = self._chunk_index(image, tile_id, band_id)
-                chunk_meta = shard.chunks[chunk_idx]
-                self.full_bytes += int(chunk_meta["length"])
-                if band_id not in freq_bands:
-                    continue
-                raw = shard.read_chunk(chunk_idx)
-                self.bytes_read += int(chunk_meta["length"])
+            metas = [
+                shard.chunks[self._chunk_index(image, tile_id, band_id)]
+                for band_id in range(self.num_bands)
+            ]
+            for chunk_meta in metas:
+                self.touched_full_band_bytes += int(chunk_meta["length"])
+            selected_payloads = {}
+            selected_bands = [b for b in range(self.num_bands) if b in freq_set]
+            for group in _consecutive_groups(selected_bands):
+                group_metas = [metas[b] for b in group]
+                span_start = min(int(m["offset"]) for m in group_metas)
+                span_end = max(int(m["offset"]) + int(m["length"]) for m in group_metas)
+                span = shard.read_span(span_start, span_end)
+                self.bytes_read += span_end - span_start
                 self.read_ops += 1
+                for band_id, chunk_meta in zip(group, group_metas):
+                    offset = int(chunk_meta["offset"]) - span_start
+                    selected_payloads[band_id] = span[offset:offset + int(chunk_meta["length"])]
+            for band_id, payload in selected_payloads.items():
+                chunk_meta = metas[band_id]
+                raw = self.codec.decompress(payload, int(chunk_meta["raw_length"]))
                 b0, b1 = self.band_specs[band_id]
                 dtype = np.int16 if band_id == 0 else np.int8
                 arr = np.frombuffer(raw, dtype=dtype).reshape(len(block_ids), 3, b1 - b0)
                 if band_id == 0:
+                    # DC is DPCM-coded across the full tile. We must decode the
+                    # whole chain before selecting crop-overlapping blocks.
                     arr = _undpcm_dc(arr).astype(np.float32)
                 else:
                     arr = arr.astype(np.float32)
@@ -377,6 +437,17 @@ def _undpcm_dc(arr: np.ndarray) -> np.ndarray:
     return np.cumsum(arr.astype(np.int16, copy=False), axis=0).astype(np.int16)
 
 
+def _consecutive_groups(values: Sequence[int]) -> List[List[int]]:
+    groups: List[List[int]] = []
+    for value in values:
+        value = int(value)
+        if not groups or value != groups[-1][-1] + 1:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return groups
+
+
 class CropDCTWriter:
     def __init__(
         self,
@@ -423,6 +494,12 @@ class CropDCTWriter:
             self.payload = open(os.path.join(shard_dir, "payload.bin"), "wb")
         return self.payload
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
     @torch.no_grad()
     def add(self, image: torch.Tensor, label: int):
         if image.ndim != 3:
@@ -446,10 +523,11 @@ class CropDCTWriter:
             tile = zz_coeffs[block_ids]
             for band_id, (b0, b1) in enumerate(self.band_specs):
                 q = self.qtables_flat[:, self.zz[b0:b1]].reshape(1, 3, b1 - b0)
-                quant = np.rint(tile[:, :, b0:b1] / q).clip(-128, 127).astype(np.int8)
                 if band_id == 0:
+                    quant = np.rint(tile[:, :, b0:b1] / q).clip(-32768, 32767).astype(np.int16)
                     raw_arr = _dpcm_dc(quant)
                 else:
+                    quant = np.rint(tile[:, :, b0:b1] / q).clip(-128, 127).astype(np.int8)
                     raw_arr = quant
                 raw = np.ascontiguousarray(raw_arr).tobytes()
                 compressed = self.codec.compress(raw)
