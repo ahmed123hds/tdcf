@@ -59,7 +59,7 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--label_smooth", type=float, default=0.1)
     p.add_argument("--amp_bf16", action="store_true")
-    p.add_argument("--crop_device", choices=["cpu", "xla"], default="cpu")
+    p.add_argument("--crop_device", choices=["xla"], default="xla")
     p.add_argument("--budget_mode", action="store_true")
     p.add_argument("--beta", type=float, default=1.0)
     p.add_argument("--max_beta", type=float, default=1.0)
@@ -71,7 +71,7 @@ def parse_args():
 
 
 def crop_batch(x: torch.Tensor, crop_size: int, is_training: bool) -> torch.Tensor:
-    _, _, h, w = x.shape
+    bsz, _, h, w = x.shape
     if crop_size <= 0 or (h == crop_size and w == crop_size):
         return x
     if crop_size > h or crop_size > w:
@@ -79,10 +79,17 @@ def crop_batch(x: torch.Tensor, crop_size: int, is_training: bool) -> torch.Tens
     if is_training:
         top = random.randint(0, h - crop_size)
         left = random.randint(0, w - crop_size)
+        ys = torch.arange(crop_size, device=x.device, dtype=x.dtype) + float(top)
+        xs = torch.arange(crop_size, device=x.device, dtype=x.dtype) + float(left)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        grid_x = (2.0 * xx / float(w - 1)) - 1.0
+        grid_y = (2.0 * yy / float(h - 1)) - 1.0
+        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(bsz, -1, -1, -1)
+        return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
     else:
         top = (h - crop_size) // 2
         left = (w - crop_size) // 2
-    return x[:, :, top:top + crop_size, left:left + crop_size]
+        return x[:, :, top:top + crop_size, left:left + crop_size]
 
 
 def build_model(args, device, img_size):
@@ -158,11 +165,10 @@ def train_process(index, args):
 
     if is_master:
         print("[INIT] Opening fast quantized train store...", flush=True)
-    store_device = torch.device("cpu") if args.crop_device == "cpu" else device
-    train_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "train"), device=store_device)
+    train_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "train"), device=device)
     if is_master:
         print("[INIT] Opening fast quantized val store...", flush=True)
-    val_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "val"), device=store_device)
+    val_store = FastQuantizedDCTStore(os.path.join(args.data_dir, "val"), device=device)
 
     train_loader, train_sampler = make_loader(
         train_store, args.batch_size, world_size, rank, True, True, args.seed
@@ -221,8 +227,6 @@ def train_process(index, args):
             labels = labels.to(device)
             x = train_store.serve_indices(idx_np)
             x = crop_batch(x, args.img_size, is_training=True)
-            if x.device != device:
-                x = x.to(device)
             if step == 0 and is_master:
                 print("  -> Got first batch from fast quant store! Warming XLA step...", flush=True)
 
@@ -291,8 +295,6 @@ def train_process(index, args):
                 labels = labels.to(device)
                 x = val_store.serve_indices(indices.numpy())
                 x = crop_batch(x, args.img_size, is_training=False)
-                if x.device != device:
-                    x = x.to(device)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
                     loss = criterion(logits, labels)
