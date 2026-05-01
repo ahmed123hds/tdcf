@@ -13,6 +13,7 @@ import os
 import random
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence
 
 import numpy as np
@@ -78,6 +79,7 @@ def parse_args():
     p.add_argument("--label_smooth", type=float, default=0.1)
     p.add_argument("--amp_bf16", action="store_true")
     p.add_argument("--decode_device", choices=["cpu"], default="cpu")
+    p.add_argument("--decode_workers", type=int, default=int(os.environ.get("DECODE_WORKERS", "8")))
     p.add_argument("--budget_mode", action="store_true")
     p.add_argument("--cap", type=float, default=100.0, help="Maximum physical frequency-band cap in percent.")
     p.add_argument("--beta", type=float, default=None, help="Initial budget ratio. Defaults to cap/100.")
@@ -168,10 +170,8 @@ def make_loader(store, batch_size, world_size, rank, shuffle, drop_last, seed):
     return DataLoader(CropDCTIndexDataset(store), batch_sampler=sampler, num_workers=0), sampler
 
 
-def read_cropdct_batch(store, indices, freq_bands, img_size, train: bool, device):
-    xs = []
-    labels = []
-    for idx in indices:
+def _read_one_cropdct(store, idx, freq_bands, img_size, train: bool):
+    with torch.no_grad():
         image = store.image_record(int(idx))
         crop_box = None if train else make_center_crop_box(image.height, image.width)
         x, label = store.read_crop(
@@ -180,8 +180,22 @@ def read_cropdct_batch(store, indices, freq_bands, img_size, train: bool, device
             freq_bands=freq_bands,
             output_size=img_size,
         )
-        xs.append(x)
-        labels.append(label)
+    return x, label
+
+
+def read_cropdct_batch(store, indices, freq_bands, img_size, train: bool, device, pool=None):
+    idx_list = [int(x) for x in indices]
+    if pool is None or len(idx_list) <= 1:
+        items = [_read_one_cropdct(store, idx, freq_bands, img_size, train) for idx in idx_list]
+    else:
+        items = list(
+            pool.map(
+                lambda idx: _read_one_cropdct(store, idx, freq_bands, img_size, train),
+                idx_list,
+            )
+        )
+    xs = [item[0] for item in items]
+    labels = [item[1] for item in items]
     batch = torch.cat(xs, dim=0).to(device)
     target = torch.tensor(labels, device=device, dtype=torch.long)
     return batch, target
@@ -242,11 +256,13 @@ def train_process(index, args):
         print(
             f"TDCF ImageNet-1K CropDCT | backbone={args.backbone} | "
             f"bands={train_store.num_bands} img={args.img_size} "
-            f"decode={args.decode_device} global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
+            f"decode={args.decode_device} workers={args.decode_workers} "
+            f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
             flush=True,
         )
         print("=" * 72, flush=True)
 
+    decode_pool = ThreadPoolExecutor(max_workers=args.decode_workers) if args.decode_workers > 1 else None
     for ep in range(start_epoch, args.epochs):
         train_sampler.set_epoch(ep)
         ratio = budget_ratio(args, ep)
@@ -262,7 +278,7 @@ def train_process(index, args):
 
         for step, (indices, _labels) in enumerate(train_loader):
             x, labels = read_cropdct_batch(
-                train_store, indices.numpy(), freq_bands, args.img_size, True, device
+                train_store, indices.numpy(), freq_bands, args.img_size, True, device, decode_pool
             )
             if step == 0 and is_master:
                 print("  -> Got first batch from CropDCT store! Warming XLA step...", flush=True)
@@ -329,7 +345,7 @@ def train_process(index, args):
         with torch.no_grad():
             for val_step, (indices, _labels) in enumerate(val_loader):
                 x, labels = read_cropdct_batch(
-                    val_store, indices.numpy(), full_bands, args.img_size, False, device
+                    val_store, indices.numpy(), full_bands, args.img_size, False, device, decode_pool
                 )
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
@@ -385,6 +401,8 @@ def train_process(index, args):
             ckpt["best_acc"] = best_acc
             xm.save(ckpt, os.path.join(args.save_dir, "best.pt"))
 
+    if decode_pool is not None:
+        decode_pool.shutdown(wait=True)
     train_store.close()
     val_store.close()
     xm.master_print(f"Training complete. Best val acc: {best_acc:.4f}")

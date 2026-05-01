@@ -201,7 +201,7 @@ class CropDCTShard:
 
     def open(self):
         if self._payload is None or self._payload.closed:
-            self._payload = open(self.payload_path, "rb")
+            self._payload = open(self.payload_path, "rb", buffering=0)
         return self._payload
 
     def close(self):
@@ -218,15 +218,11 @@ class CropDCTShard:
 
     def read_chunk(self, chunk_index: int) -> bytes:
         rec = self.chunks[int(chunk_index)]
-        f = self.open()
-        f.seek(int(rec["offset"]))
-        payload = f.read(int(rec["length"]))
+        payload = os.pread(self.open().fileno(), int(rec["length"]), int(rec["offset"]))
         return self.codec.decompress(payload, int(rec["raw_length"]))
 
     def read_span(self, start: int, end: int) -> bytes:
-        f = self.open()
-        f.seek(int(start))
-        return f.read(int(end) - int(start))
+        return os.pread(self.open().fileno(), int(end) - int(start), int(start))
 
 
 class CropDCTStore:

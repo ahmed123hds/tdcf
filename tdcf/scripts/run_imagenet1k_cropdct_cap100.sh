@@ -11,6 +11,7 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-128}"
 EPOCHS="${EPOCHS:-100}"
 BASE_LR="${BASE_LR:-0.1}"
 LR_REF_BATCH="${LR_REF_BATCH:-1024}"
+DECODE_WORKERS="${DECODE_WORKERS:-8}"
 NUM_ATTEMPTS="${NUM_ATTEMPTS:-20}"
 
 mkdir -p "${LOG_DIR}" "${SAVE_DIR}"
@@ -37,6 +38,7 @@ while [ "${attempt}" -le "${NUM_ATTEMPTS}" ]; do
     --epochs "${EPOCHS}" \
     --base_lr "${BASE_LR}" \
     --lr_ref_batch "${LR_REF_BATCH}" \
+    --decode_workers "${DECODE_WORKERS}" \
     --weight_decay 1e-4 \
     --warmup_epochs 5 \
     --label_smooth 0.1 \
