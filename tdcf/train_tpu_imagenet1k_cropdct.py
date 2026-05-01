@@ -77,6 +77,7 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--label_smooth", type=float, default=0.1)
     p.add_argument("--amp_bf16", action="store_true")
+    p.add_argument("--decode_device", choices=["cpu"], default="cpu")
     p.add_argument("--budget_mode", action="store_true")
     p.add_argument("--cap", type=float, default=100.0, help="Maximum physical frequency-band cap in percent.")
     p.add_argument("--beta", type=float, default=None, help="Initial budget ratio. Defaults to cap/100.")
@@ -199,10 +200,14 @@ def train_process(index, args):
 
     if is_master:
         print("[INIT] Opening CropDCT train store...", flush=True)
-    train_store = CropDCTStore(os.path.join(args.data_dir, "train"), device=device)
+    # CropDCT crop windows have variable block shapes. Keep reconstruction on
+    # CPU and transfer the final fixed 224x224 batch to XLA; otherwise XLA sees
+    # many irregular iDCT/crop graphs and can spend minutes compiling data code.
+    decode_device = torch.device(args.decode_device)
+    train_store = CropDCTStore(os.path.join(args.data_dir, "train"), device=decode_device)
     if is_master:
         print("[INIT] Opening CropDCT val store...", flush=True)
-    val_store = CropDCTStore(os.path.join(args.data_dir, "val"), device=device)
+    val_store = CropDCTStore(os.path.join(args.data_dir, "val"), device=decode_device)
 
     train_loader, train_sampler = make_loader(
         train_store, args.batch_size, world_size, rank, True, True, args.seed
@@ -237,7 +242,7 @@ def train_process(index, args):
         print(
             f"TDCF ImageNet-1K CropDCT | backbone={args.backbone} | "
             f"bands={train_store.num_bands} img={args.img_size} "
-            f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
+            f"decode={args.decode_device} global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
             flush=True,
         )
         print("=" * 72, flush=True)
