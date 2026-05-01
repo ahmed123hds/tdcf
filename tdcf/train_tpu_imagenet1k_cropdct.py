@@ -8,13 +8,17 @@ and trains the same ImageNet backbones used by the online WebDataset trainer.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import numpy as np
 import torch
@@ -48,16 +52,55 @@ class InputNormalize(nn.Module):
         return (x - self.mean) / self.std
 
 
-class CropDCTIndexDataset(Dataset):
-    def __init__(self, store: CropDCTStore):
-        self.store = store
+class CropDCTDecodedDataset(Dataset):
+    """Decode CropDCT samples inside DataLoader workers.
+
+    The TPU process receives fixed-size image tensors, while each worker owns a
+    private CropDCTStore handle. This keeps irregular crop/iDCT work out of the
+    XLA process and lets CPU decoding overlap with TPU training.
+    """
+
+    def __init__(self, root: str, img_size: int, freq_bands: Sequence[int], train: bool):
+        self.root = root
+        self.img_size = int(img_size)
+        self.freq_bands = tuple(int(x) for x in freq_bands)
+        self.train = bool(train)
+        with open(os.path.join(root, "metadata.json")) as f:
+            self.meta = json.load(f)
+        self.records_per_shard = int(self.meta.get("records_per_shard", 1))
+        self.num_bands = len(self.meta["band_specs"])
+        self.global_index = np.load(os.path.join(root, "global_index.npy"), allow_pickle=False)
+        self._store = None
+
+    def _get_store(self):
+        if self._store is None:
+            self._store = CropDCTStore(self.root, device=torch.device("cpu"))
+        return self._store
 
     def __len__(self):
-        return len(self.store.global_index)
+        return len(self.global_index)
 
     def __getitem__(self, idx):
-        image = self.store.image_record(int(idx))
-        return int(idx), int(image.label)
+        store = self._get_store()
+        store.reset_stats()
+        image = store.image_record(int(idx))
+        crop_box = None if self.train else make_center_crop_box(image.height, image.width)
+        x, label = store.read_crop(
+            int(idx),
+            crop_box=crop_box,
+            freq_bands=self.freq_bands,
+            output_size=self.img_size,
+        )
+        stats = store.get_read_stats()
+        stat_tensor = torch.tensor(
+            [
+                stats["bytes_read"],
+                stats["touched_full_band_bytes"],
+                stats["full_image_bytes"],
+            ],
+            dtype=torch.float64,
+        )
+        return x.squeeze(0), int(label), stat_tensor
 
 
 def parse_args():
@@ -78,8 +121,9 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--label_smooth", type=float, default=0.1)
     p.add_argument("--amp_bf16", action="store_true")
-    p.add_argument("--decode_device", choices=["cpu"], default="cpu")
-    p.add_argument("--decode_workers", type=int, default=int(os.environ.get("DECODE_WORKERS", "8")))
+    p.add_argument("--loader_workers", type=int, default=int(os.environ.get("LOADER_WORKERS", os.environ.get("DECODE_WORKERS", "4"))))
+    p.add_argument("--prefetch_factor", type=int, default=int(os.environ.get("PREFETCH_FACTOR", "2")))
+    p.add_argument("--cpu_threads", type=int, default=int(os.environ.get("CPU_THREADS", "1")))
     p.add_argument("--budget_mode", action="store_true")
     p.add_argument("--cap", type=float, default=100.0, help="Maximum physical frequency-band cap in percent.")
     p.add_argument("--beta", type=float, default=None, help="Initial budget ratio. Defaults to cap/100.")
@@ -155,11 +199,32 @@ def make_center_crop_box(height: int, width: int):
     return (int(height - crop) // 2, int(width - crop) // 2, crop, crop)
 
 
-def make_loader(store, batch_size, world_size, rank, shuffle, drop_last, seed):
-    records_per_shard = int(store.meta.get("records_per_shard", len(store.global_index)))
+def seed_worker(worker_id):
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.set_num_threads(1)
+
+
+def make_loader(
+    root,
+    img_size,
+    freq_bands,
+    train,
+    batch_size,
+    world_size,
+    rank,
+    shuffle,
+    drop_last,
+    seed,
+    epoch,
+    num_workers,
+    prefetch_factor,
+):
+    dataset = CropDCTDecodedDataset(root, img_size, freq_bands, train=train)
     sampler = FastShardBatchSampler(
-        num_samples=len(store.global_index),
-        records_per_shard=records_per_shard,
+        num_samples=len(dataset),
+        records_per_shard=dataset.records_per_shard,
         batch_size=batch_size,
         num_replicas=world_size,
         rank=rank,
@@ -167,38 +232,20 @@ def make_loader(store, batch_size, world_size, rank, shuffle, drop_last, seed):
         drop_last=drop_last,
         seed=seed,
     )
-    return DataLoader(CropDCTIndexDataset(store), batch_sampler=sampler, num_workers=0), sampler
-
-
-def _read_one_cropdct(store, idx, freq_bands, img_size, train: bool):
-    with torch.no_grad():
-        image = store.image_record(int(idx))
-        crop_box = None if train else make_center_crop_box(image.height, image.width)
-        x, label = store.read_crop(
-            int(idx),
-            crop_box=crop_box,
-            freq_bands=freq_bands,
-            output_size=img_size,
-        )
-    return x, label
-
-
-def read_cropdct_batch(store, indices, freq_bands, img_size, train: bool, device, pool=None):
-    idx_list = [int(x) for x in indices]
-    if pool is None or len(idx_list) <= 1:
-        items = [_read_one_cropdct(store, idx, freq_bands, img_size, train) for idx in idx_list]
-    else:
-        items = list(
-            pool.map(
-                lambda idx: _read_one_cropdct(store, idx, freq_bands, img_size, train),
-                idx_list,
-            )
-        )
-    xs = [item[0] for item in items]
-    labels = [item[1] for item in items]
-    batch = torch.cat(xs, dim=0).to(device)
-    target = torch.tensor(labels, device=device, dtype=torch.long)
-    return batch, target
+    sampler.set_epoch(epoch)
+    generator = torch.Generator()
+    generator.manual_seed(seed + epoch * 1009 + rank)
+    kwargs = {
+        "batch_sampler": sampler,
+        "num_workers": int(num_workers),
+        "pin_memory": False,
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+        kwargs["persistent_workers"] = False
+    return DataLoader(dataset, **kwargs), sampler, dataset
 
 
 def train_process(index, args):
@@ -211,23 +258,33 @@ def train_process(index, args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+    torch.set_num_threads(max(1, int(args.cpu_threads)))
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
 
     if is_master:
-        print("[INIT] Opening CropDCT train store...", flush=True)
-    # CropDCT crop windows have variable block shapes. Keep reconstruction on
-    # CPU and transfer the final fixed 224x224 batch to XLA; otherwise XLA sees
-    # many irregular iDCT/crop graphs and can spend minutes compiling data code.
-    decode_device = torch.device(args.decode_device)
-    train_store = CropDCTStore(os.path.join(args.data_dir, "train"), device=decode_device)
-    if is_master:
-        print("[INIT] Opening CropDCT val store...", flush=True)
-    val_store = CropDCTStore(os.path.join(args.data_dir, "val"), device=decode_device)
-
-    train_loader, train_sampler = make_loader(
-        train_store, args.batch_size, world_size, rank, True, True, args.seed
-    )
-    val_loader, _ = make_loader(
-        val_store, args.eval_batch_size, world_size, rank, False, False, args.seed
+        print("[INIT] Reading CropDCT metadata...", flush=True)
+    train_root = os.path.join(args.data_dir, "train")
+    val_root = os.path.join(args.data_dir, "val")
+    train_info = CropDCTDecodedDataset(train_root, args.img_size, (0,), train=True)
+    val_info = CropDCTDecodedDataset(val_root, args.img_size, tuple(range(train_info.num_bands)), train=False)
+    full_val_bands = tuple(range(val_info.num_bands))
+    val_loader, _val_sampler, _ = make_loader(
+        val_root,
+        args.img_size,
+        full_val_bands,
+        False,
+        args.eval_batch_size,
+        world_size,
+        rank,
+        False,
+        False,
+        args.seed,
+        0,
+        args.loader_workers,
+        args.prefetch_factor,
     )
 
     global_bs = args.batch_size * world_size
@@ -255,31 +312,47 @@ def train_process(index, args):
         print("=" * 72, flush=True)
         print(
             f"TDCF ImageNet-1K CropDCT | backbone={args.backbone} | "
-            f"bands={train_store.num_bands} img={args.img_size} "
-            f"decode={args.decode_device} workers={args.decode_workers} "
+            f"bands={train_info.num_bands} img={args.img_size} "
+            f"loader_workers={args.loader_workers} cpu_threads={args.cpu_threads} "
             f"global_bs={global_bs} scaled_lr={scaled_lr:.5f}",
             flush=True,
         )
         print("=" * 72, flush=True)
 
-    decode_pool = ThreadPoolExecutor(max_workers=args.decode_workers) if args.decode_workers > 1 else None
     for ep in range(start_epoch, args.epochs):
-        train_sampler.set_epoch(ep)
         ratio = budget_ratio(args, ep)
-        freq_bands = freq_bands_for_ratio(train_store.num_bands, ratio)
-        train_store.reset_stats()
+        freq_bands = freq_bands_for_ratio(train_info.num_bands, ratio)
+        train_loader, train_sampler, _ = make_loader(
+            train_root,
+            args.img_size,
+            freq_bands,
+            True,
+            args.batch_size,
+            world_size,
+            rank,
+            True,
+            True,
+            args.seed,
+            ep,
+            args.loader_workers,
+            args.prefetch_factor,
+        )
         model.train()
         tr_loss_accum = tr_corr_accum = tr_n_accum = 0.0
+        read_bytes_accum = touched_bytes_accum = full_bytes_accum = 0.0
         tr_loss_t = torch.zeros(1, device=device)
         tr_corr_t = torch.zeros(1, device=device)
         tr_n_t = torch.zeros(1, device=device)
         train_start = time.time()
         step_start = time.time()
 
-        for step, (indices, _labels) in enumerate(train_loader):
-            x, labels = read_cropdct_batch(
-                train_store, indices.numpy(), freq_bands, args.img_size, True, device, decode_pool
-            )
+        for step, (x_cpu, labels_cpu, stat_cpu) in enumerate(train_loader):
+            stat_sum = stat_cpu.sum(dim=0)
+            read_bytes_accum += float(stat_sum[0].item())
+            touched_bytes_accum += float(stat_sum[1].item())
+            full_bytes_accum += float(stat_sum[2].item())
+            x = x_cpu.to(device)
+            labels = labels_cpu.to(device)
             if step == 0 and is_master:
                 print("  -> Got first batch from CropDCT store! Warming XLA step...", flush=True)
 
@@ -330,23 +403,23 @@ def train_process(index, args):
         tr_n_total = xm.mesh_reduce(f"cropdct_tr_n_{ep}", tr_n_accum, sum)
         tr_corr_total = xm.mesh_reduce(f"cropdct_tr_corr_{ep}", tr_corr_accum, sum)
         tr_loss_total = xm.mesh_reduce(f"cropdct_tr_loss_{ep}", tr_loss_accum, sum)
+        read_bytes_total = xm.mesh_reduce(f"cropdct_read_bytes_{ep}", read_bytes_accum, sum)
+        touched_bytes_total = xm.mesh_reduce(f"cropdct_touched_bytes_{ep}", touched_bytes_accum, sum)
+        full_bytes_total = xm.mesh_reduce(f"cropdct_full_bytes_{ep}", full_bytes_accum, sum)
         tr_acc = tr_corr_total / tr_n_total if tr_n_total > 0 else 0.0
         tr_loss = tr_loss_total / tr_n_total if tr_n_total > 0 else 0.0
         train_time = time.time() - train_start
 
-        val_store.reset_stats()
         model.eval()
         va_loss_accum = va_corr_accum = va_n_accum = 0.0
         va_loss_t = torch.zeros(1, device=device)
         va_corr_t = torch.zeros(1, device=device)
         va_n_t = torch.zeros(1, device=device)
         val_start = time.time()
-        full_bands = tuple(range(val_store.num_bands))
         with torch.no_grad():
-            for val_step, (indices, _labels) in enumerate(val_loader):
-                x, labels = read_cropdct_batch(
-                    val_store, indices.numpy(), full_bands, args.img_size, False, device, decode_pool
-                )
+            for val_step, (x_cpu, labels_cpu, _stat_cpu) in enumerate(val_loader):
+                x = x_cpu.to(device)
+                labels = labels_cpu.to(device)
                 with torch.autocast("xla", dtype=torch.bfloat16, enabled=args.amp_bf16):
                     logits = model(x)
                     loss = criterion(logits, labels)
@@ -369,17 +442,18 @@ def train_process(index, args):
         va_acc = va_corr_total / va_n_total if va_n_total > 0 else 0.0
         va_loss = va_loss_total / va_n_total if va_n_total > 0 else 0.0
         val_time = time.time() - val_start
-        stats = train_store.get_read_stats()
+        phys_io = read_bytes_total / touched_bytes_total if touched_bytes_total > 0 else 0.0
+        img_io = read_bytes_total / full_bytes_total if full_bytes_total > 0 else 0.0
         sched_lr.step()
 
         if is_master:
             print(
                 f"E {ep+1:3d}/{args.epochs} | BudgetRatio={ratio:.3f} | "
-                f"Bands={len(freq_bands)}/{train_store.num_bands} | "
-                f"PhysIO={stats['crop_io_ratio']:.3f} ImgIO={stats['image_io_ratio']:.3f} | "
+                f"Bands={len(freq_bands)}/{train_info.num_bands} | "
+                f"PhysIO={phys_io:.3f} ImgIO={img_io:.3f} | "
                 f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} ({train_time:.1f}s) | "
                 f"Val Loss={va_loss:.4f} Val Acc={va_acc:.4f} ({val_time:.1f}s) | "
-                f"ReadGB={stats['bytes_read']/1e9:.3f}/{stats['touched_full_band_bytes']/1e9:.3f} | "
+                f"ReadGB={read_bytes_total/1e9:.3f}/{touched_bytes_total/1e9:.3f} | "
                 f"LR={opt.param_groups[0]['lr']:.2e}",
                 flush=True,
             )
@@ -401,10 +475,6 @@ def train_process(index, args):
             ckpt["best_acc"] = best_acc
             xm.save(ckpt, os.path.join(args.save_dir, "best.pt"))
 
-    if decode_pool is not None:
-        decode_pool.shutdown(wait=True)
-    train_store.close()
-    val_store.close()
     xm.master_print(f"Training complete. Best val acc: {best_acc:.4f}")
 
 
