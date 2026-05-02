@@ -502,7 +502,7 @@ class CropDCTWriter:
         self.close()
 
     @torch.no_grad()
-    def add(self, image: torch.Tensor, label: int):
+    def add(self, image: torch.Tensor, label: int, source_key: str = ""):
         if image.ndim != 3:
             raise ValueError("CropDCTWriter.add expects CHW image")
         image_id = len(self.global_rows)
@@ -555,6 +555,7 @@ class CropDCTWriter:
                 int(npw),
                 int(len(specs)),
                 int(chunk_base),
+                str(source_key),
             )
         )
         self.global_rows.append((int(image_id), int(self.shard_id), int(self.rows_in_shard)))
@@ -580,6 +581,7 @@ class CropDCTWriter:
                 ("npw", "<i4"),
                 ("num_tiles", "<i4"),
                 ("chunk_base", "<i8"),
+                ("source_key", "U256"),
             ]
         )
         chunk_dtype = np.dtype(
