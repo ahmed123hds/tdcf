@@ -28,6 +28,7 @@ RANDOM_SUBSET="${RANDOM_SUBSET:-0}"
 SHUFFLE_BUFFER="${SHUFFLE_BUFFER:-10000}"
 SEED="${SEED:-42}"
 RESUME="${RESUME:-0}"
+SKIP_LOG_EVERY="${SKIP_LOG_EVERY:-10000}"
 
 mkdir -p "$OUT_ROOT"
 
@@ -46,6 +47,7 @@ python3 -m tdcf.prepare_cropdct_store \
   --device "$DEVICE" \
   --seed "$SEED" \
   --shuffle_buffer "$SHUFFLE_BUFFER" \
+  --skip_log_every "$SKIP_LOG_EVERY" \
   $([[ "$RANDOM_SUBSET" == "1" ]] && echo "--random_subset") \
   $([[ "$RESUME" == "1" ]] && echo "--resume") \
   ${MAX_SAMPLES:+--max_samples "$MAX_SAMPLES"}
@@ -65,6 +67,7 @@ python3 -m tdcf.prepare_cropdct_store \
   --device "$DEVICE" \
   --seed "$SEED" \
   --shuffle_buffer "$SHUFFLE_BUFFER" \
+  --skip_log_every "$SKIP_LOG_EVERY" \
   $([[ "$RANDOM_SUBSET" == "1" ]] && echo "--random_subset") \
   $([[ "$RESUME" == "1" ]] && echo "--resume") \
   ${MAX_VAL_SAMPLES:+--max_samples "$MAX_VAL_SAMPLES"}

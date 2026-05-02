@@ -35,6 +35,8 @@ def parse_args():
                    help="WebDataset sample shuffle buffer used with --random_subset.")
     p.add_argument("--resume", action="store_true",
                    help="Resume from completed CropDCT shards in --out_dir.")
+    p.add_argument("--skip_log_every", type=int, default=10000,
+                   help="Progress interval while skipping already completed source samples during resume.")
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
@@ -123,7 +125,14 @@ def build_loader(args, skip_samples: int = 0):
     def iterator():
         for source_idx, (key, url, img_raw, label_raw) in enumerate(dataset, start=1):
             if source_idx <= skip_samples:
+                if args.skip_log_every > 0 and source_idx % args.skip_log_every == 0:
+                    print(
+                        f"[cropdct-resume] skipped {source_idx}/{skip_samples} raw source samples",
+                        flush=True,
+                    )
                 continue
+            if skip_samples and source_idx == skip_samples + 1:
+                print(f"[cropdct-resume] reached resume point at source sample {source_idx}", flush=True)
             img = transform(image_from_raw(img_raw))
             yield img, identity_label(label_raw), str(key), str(url)
 
