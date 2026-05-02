@@ -233,6 +233,12 @@ class CropDCTStore:
             self.meta = json.load(f)
         if self.meta.get("format") != "cropdct_v1":
             raise ValueError(f"{root} is not a CropDCT v1 store")
+        if self.meta.get("coefficient_dtype") != "int16" or self.meta.get("ac_storage_dtype") != "int16":
+            raise ValueError(
+                f"{root} uses old CropDCT AC storage "
+                f"({self.meta.get('coefficient_dtype')}/{self.meta.get('ac_storage_dtype')}). "
+                "Rebuild the CropDCT store with the int16 AC writer."
+            )
         self.block_size = int(self.meta["block_size"])
         self.tile_blocks = int(self.meta["tile_blocks"])
         self.band_specs = [tuple(x) for x in self.meta["band_specs"]]
@@ -374,8 +380,7 @@ class CropDCTStore:
                 chunk_meta = metas[band_id]
                 raw = self.codec.decompress(payload, int(chunk_meta["raw_length"]))
                 b0, b1 = self.band_specs[band_id]
-                dtype = np.int16 if band_id == 0 else np.int8
-                arr = np.frombuffer(raw, dtype=dtype).reshape(len(block_ids), 3, b1 - b0)
+                arr = np.frombuffer(raw, dtype=np.int16).reshape(len(block_ids), 3, b1 - b0)
                 if band_id == 0:
                     # DC is DPCM-coded across the full tile. We must decode the
                     # whole chain before selecting crop-overlapping blocks.
@@ -523,7 +528,7 @@ class CropDCTWriter:
                     quant = np.rint(tile[:, :, b0:b1] / q).clip(-32768, 32767).astype(np.int16)
                     raw_arr = _dpcm_dc(quant)
                 else:
-                    quant = np.rint(tile[:, :, b0:b1] / q).clip(-128, 127).astype(np.int8)
+                    quant = np.rint(tile[:, :, b0:b1] / q).clip(-32768, 32767).astype(np.int16)
                     raw_arr = quant
                 raw = np.ascontiguousarray(raw_arr).tobytes()
                 compressed = self.codec.compress(raw)
@@ -617,8 +622,9 @@ class CropDCTWriter:
             "compression_level": int(self.compression_level),
             "color_space": "YCbCr",
             "level_shift": 128,
-            "coefficient_dtype": "int8",
+            "coefficient_dtype": "int16",
             "dc_storage_dtype": "int16_dpcm",
+            "ac_storage_dtype": "int16",
             "zigzag_order": self.zz.tolist(),
             "records_per_shard": int(self.records_per_shard),
             "num_images": int(len(self.global_rows)),
