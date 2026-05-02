@@ -27,6 +27,7 @@ MAX_LONGER="${MAX_LONGER:-0}"
 RANDOM_SUBSET="${RANDOM_SUBSET:-0}"
 SHUFFLE_BUFFER="${SHUFFLE_BUFFER:-10000}"
 SEED="${SEED:-42}"
+RESUME="${RESUME:-0}"
 
 mkdir -p "$OUT_ROOT"
 
@@ -46,6 +47,7 @@ python3 -m tdcf.prepare_cropdct_store \
   --seed "$SEED" \
   --shuffle_buffer "$SHUFFLE_BUFFER" \
   $([[ "$RANDOM_SUBSET" == "1" ]] && echo "--random_subset") \
+  $([[ "$RESUME" == "1" ]] && echo "--resume") \
   ${MAX_SAMPLES:+--max_samples "$MAX_SAMPLES"}
 
 echo "[cropdct-prep] Building val store at $OUT_ROOT/val"
@@ -64,6 +66,7 @@ python3 -m tdcf.prepare_cropdct_store \
   --seed "$SEED" \
   --shuffle_buffer "$SHUFFLE_BUFFER" \
   $([[ "$RANDOM_SUBSET" == "1" ]] && echo "--random_subset") \
+  $([[ "$RESUME" == "1" ]] && echo "--resume") \
   ${MAX_VAL_SAMPLES:+--max_samples "$MAX_VAL_SAMPLES"}
 
 echo "[cropdct-prep] Done. Store root: $OUT_ROOT"

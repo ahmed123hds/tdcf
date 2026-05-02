@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import shutil
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -461,6 +462,7 @@ class CropDCTWriter:
         compression: str = "zstd",
         compression_level: int = 1,
         device: Optional[torch.device] = None,
+        resume: bool = False,
     ):
         self.root = root
         self.records_per_shard = int(records_per_shard)
@@ -477,8 +479,68 @@ class CropDCTWriter:
         self.zz = zigzag_order(block_size, block_size).numpy()
         self.shards_meta = []
         self.global_rows = []
-        self._reset_shard(0)
         os.makedirs(root, exist_ok=True)
+        next_shard = self._load_completed_shards() if resume else 0
+        self._reset_shard(next_shard)
+
+    def _load_completed_shards(self) -> int:
+        shard_dirs = sorted(
+            d for d in os.listdir(self.root)
+            if d.startswith("shard_") and os.path.isdir(os.path.join(self.root, d))
+        )
+        next_image_id = 0
+        next_shard = 0
+        for dirname in shard_dirs:
+            shard_dir = os.path.join(self.root, dirname)
+            try:
+                shard_id = int(dirname.split("_", 1)[1])
+            except ValueError:
+                continue
+            images_path = os.path.join(shard_dir, "images.npy")
+            chunks_path = os.path.join(shard_dir, "chunks.npy")
+            payload_path = os.path.join(shard_dir, "payload.bin")
+            if not (
+                os.path.isfile(images_path)
+                and os.path.isfile(chunks_path)
+                and os.path.isfile(payload_path)
+            ):
+                quarantine = f"{shard_dir}.incomplete"
+                if not os.path.exists(quarantine):
+                    shutil.move(shard_dir, quarantine)
+                continue
+            images = np.load(images_path, allow_pickle=False)
+            chunks = np.load(chunks_path, allow_pickle=False)
+            if len(images) == 0:
+                continue
+            if (
+                int(images[0]["image_id"]) != next_image_id
+                or int(images[-1]["image_id"]) != next_image_id + len(images) - 1
+            ):
+                raise RuntimeError(
+                    f"Cannot resume {self.root}: non-contiguous image ids in {dirname}. "
+                    f"Expected start {next_image_id}, got {int(images[0]['image_id'])}."
+                )
+            payload_bytes = os.path.getsize(payload_path)
+            self.shards_meta.append(
+                {
+                    "shard_id": int(shard_id),
+                    "dir": dirname,
+                    "num_images": int(len(images)),
+                    "num_chunks": int(len(chunks)),
+                    "payload_bytes": int(payload_bytes),
+                }
+            )
+            for row in range(len(images)):
+                self.global_rows.append((int(images[row]["image_id"]), int(shard_id), int(row)))
+            next_image_id += len(images)
+            next_shard = max(next_shard, shard_id + 1)
+        if next_image_id:
+            print(
+                f"[cropdct-resume] found {next_image_id} completed samples across "
+                f"{len(self.shards_meta)} shards in {self.root}; next_shard={next_shard}",
+                flush=True,
+            )
+        return next_shard
 
     def _reset_shard(self, shard_id: int):
         self.shard_id = int(shard_id)
@@ -492,7 +554,7 @@ class CropDCTWriter:
         if self.payload is None:
             shard_dir = os.path.join(self.root, f"shard_{self.shard_id:05d}")
             os.makedirs(shard_dir, exist_ok=True)
-            self.payload = open(os.path.join(shard_dir, "payload.bin"), "wb")
+            self.payload = open(os.path.join(shard_dir, "payload.bin"), "xb")
         return self.payload
 
     def __enter__(self):

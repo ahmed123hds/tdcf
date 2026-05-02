@@ -31,6 +31,8 @@ def parse_args():
                    help="Shuffle shard order and stream order before taking --max_samples.")
     p.add_argument("--shuffle_buffer", type=int, default=10000,
                    help="WebDataset sample shuffle buffer used with --random_subset.")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from completed CropDCT shards in --out_dir.")
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
@@ -125,14 +127,26 @@ def build_store(args):
         compression=args.compression,
         compression_level=args.compression_level,
         device=torch.device(args.device),
+        resume=args.resume,
     )
     start = time.time()
-    count = 0
-    for count, (img, label, source_key, source_url) in enumerate(build_loader(args), start=1):
+    completed = len(writer.global_rows)
+    count = completed
+    if completed:
+        print(f"[cropdct-resume] skipping first {completed} source samples", flush=True)
+    for source_idx, (img, label, source_key, source_url) in enumerate(build_loader(args), start=1):
+        if source_idx <= completed:
+            continue
         writer.add(img, int(label), source_key=str(source_key), source_url=str(source_url))
+        count += 1
         if count % 1000 == 0:
             elapsed = time.time() - start
-            print(f"[cropdct] wrote {count} samples ({count / max(elapsed, 1e-6):.1f} img/s)", flush=True)
+            new_count = count - completed
+            print(
+                f"[cropdct] wrote {count} samples total | resumed_new={new_count} "
+                f"({new_count / max(elapsed, 1e-6):.1f} img/s)",
+                flush=True,
+            )
         if args.max_samples > 0 and count >= args.max_samples:
             break
     writer.close()
