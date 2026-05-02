@@ -81,18 +81,28 @@ def _decode_label(data: bytes) -> int:
     return int(text)
 
 
-def load_reference_by_key_fast(shards: str, needed_keys: Set[str]) -> Dict[str, Tuple[torch.Tensor, int]]:
+def load_reference_by_key_fast(
+    shards: str,
+    needed_keys: Set[str],
+    key_to_url: Dict[str, str],
+) -> Dict[str, Tuple[torch.Tensor, int]]:
     """Load exact reference samples by key, opening only relevant tar shards."""
     urls = expand_shards(shards)
     if not urls:
         raise ValueError(f"No shards expanded from {shards!r}")
     prefix_to_path = {os.path.splitext(os.path.basename(path))[0]: path for path in urls}
-    key_groups: Dict[str, Set[str]] = {}
+    basename_to_path = {os.path.basename(path): path for path in urls}
+    path_groups: Dict[str, Set[str]] = {}
     fallback_keys: Set[str] = set()
     for key in needed_keys:
+        source_url = key_to_url.get(key, "")
+        source_base = os.path.basename(source_url)
+        if source_base in basename_to_path:
+            path_groups.setdefault(basename_to_path[source_base], set()).add(key)
+            continue
         prefix = _key_to_shard_prefix(key)
         if prefix in prefix_to_path:
-            key_groups.setdefault(prefix, set()).add(key)
+            path_groups.setdefault(prefix_to_path[prefix], set()).add(key)
         else:
             fallback_keys.add(key)
 
@@ -107,8 +117,7 @@ def load_reference_by_key_fast(shards: str, needed_keys: Set[str]) -> Dict[str, 
     refs: Dict[str, Tuple[torch.Tensor, int]] = {}
     image_exts = {"jpg", "jpeg", "png"}
     label_exts = {"cls"}
-    for prefix, keys in sorted(key_groups.items()):
-        path = prefix_to_path[prefix]
+    for path, keys in sorted(path_groups.items()):
         print(f"[cropdct-fidelity] opening {os.path.basename(path)} for {len(keys)} keys", flush=True)
         tmp: Dict[str, Dict[str, object]] = {}
         with tarfile.open(path, "r:*") as tar:
@@ -150,8 +159,9 @@ def load_reference_by_key_fast(shards: str, needed_keys: Set[str]) -> Dict[str, 
     return refs
 
 
-def collect_needed_keys(store_dirs: Iterable[str], samples: int) -> Set[str]:
+def collect_needed_keys_and_urls(store_dirs: Iterable[str], samples: int) -> Tuple[Set[str], Dict[str, str]]:
     needed: Set[str] = set()
+    key_to_url: Dict[str, str] = {}
     for store_dir in store_dirs:
         store = CropDCTStore(store_dir, device=torch.device("cpu"))
         for image_id in range(min(samples, len(store.global_index))):
@@ -164,9 +174,12 @@ def collect_needed_keys(store_dirs: Iterable[str], samples: int) -> Set[str]:
                     f"{store_dir} does not contain source_key metadata. "
                     "Rebuild the random subset with the latest code before running fidelity validation."
                 )
-            needed.add(str(img["source_key"]))
+            key = str(img["source_key"])
+            needed.add(key)
+            if "source_url" in img.dtype.names:
+                key_to_url[key] = str(img["source_url"])
         store.close()
-    return needed
+    return needed, key_to_url
 
 
 def validate_store(store_dir: str, refs: Dict[str, Tuple[torch.Tensor, int]], samples: int) -> Dict[str, float]:
@@ -240,9 +253,9 @@ def main():
     store_dirs = [x.strip() for x in args.store_dirs.split(",") if x.strip()]
     if not store_dirs:
         raise ValueError("--store_dirs is empty")
-    needed_keys = collect_needed_keys(store_dirs, args.samples)
+    needed_keys, key_to_url = collect_needed_keys_and_urls(store_dirs, args.samples)
     print(f"[cropdct-fidelity] loading {len(needed_keys)} reference images by source_key", flush=True)
-    refs = load_reference_by_key_fast(args.shards, needed_keys)
+    refs = load_reference_by_key_fast(args.shards, needed_keys, key_to_url)
     rows = []
     for store_dir in store_dirs:
         stats = validate_store(store_dir, refs, args.samples)

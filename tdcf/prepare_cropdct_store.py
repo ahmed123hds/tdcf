@@ -68,7 +68,7 @@ def build_loader(args):
         for i in range(n):
             h = 180 + (i % 9) * 23
             w = 190 + (i % 7) * 31
-            samples.append((torch.rand(3, h, w, generator=g), i % 1000, f"synthetic-{i:06d}"))
+            samples.append((torch.rand(3, h, w, generator=g), i % 1000, f"synthetic-{i:06d}", "synthetic"))
         return samples
 
     if args.shards is None:
@@ -105,9 +105,9 @@ def build_loader(args):
         dataset = dataset.shuffle(args.shuffle_buffer, initial=min(args.shuffle_buffer, 1000))
     dataset = (
         dataset.decode("pil")
-        .to_tuple("__key__", "jpg;jpeg;png", "cls")
-        .map_tuple(str, transform, identity_label)
-        .map(lambda sample: (sample[1], sample[2], sample[0]))
+        .to_tuple("__key__", "__url__", "jpg;jpeg;png", "cls")
+        .map_tuple(str, str, transform, identity_label)
+        .map(lambda sample: (sample[2], sample[3], sample[0], sample[1]))
     )
     return wds.WebLoader(dataset, batch_size=None, num_workers=0)
 
@@ -128,8 +128,8 @@ def build_store(args):
     )
     start = time.time()
     count = 0
-    for count, (img, label, source_key) in enumerate(build_loader(args), start=1):
-        writer.add(img, int(label), source_key=str(source_key))
+    for count, (img, label, source_key, source_url) in enumerate(build_loader(args), start=1):
+        writer.add(img, int(label), source_key=str(source_key), source_url=str(source_url))
         if count % 1000 == 0:
             elapsed = time.time() - start
             print(f"[cropdct] wrote {count} samples ({count / max(elapsed, 1e-6):.1f} img/s)", flush=True)
