@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import random
 import re
@@ -10,6 +11,7 @@ import time
 
 import torch
 import torchvision.transforms.functional as TF
+from PIL import Image
 
 from tdcf.cropdct_store import DEFAULT_BANDS, CropDCTWriter
 
@@ -62,12 +64,14 @@ def identity_label(label):
     return int(label)
 
 
-def build_loader(args):
+def build_loader(args, skip_samples: int = 0):
     if args.source == "synthetic":
         n = args.max_samples if args.max_samples > 0 else 64
         g = torch.Generator().manual_seed(args.seed)
         samples = []
         for i in range(n):
+            if i < skip_samples:
+                continue
             h = 180 + (i % 9) * 23
             w = 190 + (i % 7) * 31
             samples.append((torch.rand(3, h, w, generator=g), i % 1000, f"synthetic-{i:06d}", "synthetic"))
@@ -89,6 +93,15 @@ def build_loader(args):
                 img = img.resize((int(round(w * scale)), int(round(h * scale))))
         return TF.to_tensor(img)
 
+    def image_from_raw(value):
+        if isinstance(value, Image.Image):
+            return value
+        if isinstance(value, bytes):
+            return Image.open(io.BytesIO(value))
+        if hasattr(value, "read"):
+            return Image.open(value)
+        raise TypeError(f"Unsupported image payload type: {type(value)!r}")
+
     urls = expand_shards(args.shards)
     if not urls:
         raise ValueError(f"No shards expanded from {args.shards!r}")
@@ -105,13 +118,16 @@ def build_loader(args):
     dataset = wds.WebDataset(urls, resampled=False, shardshuffle=False)
     if args.random_subset:
         dataset = dataset.shuffle(args.shuffle_buffer, initial=min(args.shuffle_buffer, 1000))
-    dataset = (
-        dataset.decode("pil")
-        .to_tuple("__key__", "__url__", "jpg;jpeg;png", "cls")
-        .map_tuple(str, str, transform, identity_label)
-        .map(lambda sample: (sample[2], sample[3], sample[0], sample[1]))
-    )
-    return wds.WebLoader(dataset, batch_size=None, num_workers=0)
+    dataset = dataset.to_tuple("__key__", "__url__", "jpg;jpeg;png", "cls")
+
+    def iterator():
+        for source_idx, (key, url, img_raw, label_raw) in enumerate(dataset, start=1):
+            if source_idx <= skip_samples:
+                continue
+            img = transform(image_from_raw(img_raw))
+            yield img, identity_label(label_raw), str(key), str(url)
+
+    return iterator()
 
 
 def build_store(args):
@@ -133,10 +149,8 @@ def build_store(args):
     completed = len(writer.global_rows)
     count = completed
     if completed:
-        print(f"[cropdct-resume] skipping first {completed} source samples", flush=True)
-    for source_idx, (img, label, source_key, source_url) in enumerate(build_loader(args), start=1):
-        if source_idx <= completed:
-            continue
+        print(f"[cropdct-resume] skipping first {completed} source samples before PIL decode", flush=True)
+    for img, label, source_key, source_url in build_loader(args, skip_samples=completed):
         writer.add(img, int(label), source_key=str(source_key), source_url=str(source_url))
         count += 1
         if count % 1000 == 0:
