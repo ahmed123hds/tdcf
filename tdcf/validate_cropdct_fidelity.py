@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
+import tarfile
 from typing import Dict, Iterable, List, Set, Tuple
 
 import numpy as np
 import torch
 import torchvision.transforms as T
 import webdataset as wds
+from PIL import Image
 
 from tdcf.cropdct_store import CropDCTStore
 
@@ -61,6 +64,89 @@ def load_reference_by_key(shards: str, needed_keys: Set[str]) -> Dict[str, Tuple
     if missing:
         preview = ", ".join(sorted(list(missing))[:5])
         raise RuntimeError(f"Missing {len(missing)} source keys from WebDataset shards. Examples: {preview}")
+    return refs
+
+
+def _key_to_shard_prefix(key: str) -> str:
+    return key.split("/", 1)[0] if "/" in key else ""
+
+
+def _member_base(name: str) -> str:
+    base = name[2:] if name.startswith("./") else name
+    return base.rsplit(".", 1)[0]
+
+
+def _decode_label(data: bytes) -> int:
+    text = data.decode("utf-8").strip()
+    return int(text)
+
+
+def load_reference_by_key_fast(shards: str, needed_keys: Set[str]) -> Dict[str, Tuple[torch.Tensor, int]]:
+    """Load exact reference samples by key, opening only relevant tar shards."""
+    urls = expand_shards(shards)
+    if not urls:
+        raise ValueError(f"No shards expanded from {shards!r}")
+    prefix_to_path = {os.path.splitext(os.path.basename(path))[0]: path for path in urls}
+    key_groups: Dict[str, Set[str]] = {}
+    fallback_keys: Set[str] = set()
+    for key in needed_keys:
+        prefix = _key_to_shard_prefix(key)
+        if prefix in prefix_to_path:
+            key_groups.setdefault(prefix, set()).add(key)
+        else:
+            fallback_keys.add(key)
+
+    if fallback_keys:
+        print(
+            f"[cropdct-fidelity] {len(fallback_keys)} keys do not include a known shard prefix; "
+            "falling back to streaming lookup for those keys",
+            flush=True,
+        )
+
+    to_tensor = T.ToTensor()
+    refs: Dict[str, Tuple[torch.Tensor, int]] = {}
+    image_exts = {"jpg", "jpeg", "png"}
+    label_exts = {"cls"}
+    for prefix, keys in sorted(key_groups.items()):
+        path = prefix_to_path[prefix]
+        print(f"[cropdct-fidelity] opening {os.path.basename(path)} for {len(keys)} keys", flush=True)
+        tmp: Dict[str, Dict[str, object]] = {}
+        with tarfile.open(path, "r:*") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                sample_key = _member_base(member.name)
+                if sample_key not in keys:
+                    continue
+                ext = member.name.rsplit(".", 1)[-1].lower()
+                if ext not in image_exts and ext not in label_exts:
+                    continue
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                data = f.read()
+                rec = tmp.setdefault(sample_key, {})
+                if ext in image_exts:
+                    rec["image"] = to_tensor(Image.open(io.BytesIO(data)).convert("RGB"))
+                elif ext in label_exts:
+                    rec["label"] = _decode_label(data)
+                if "image" in rec and "label" in rec:
+                    refs[sample_key] = (rec["image"], int(rec["label"]))
+                    if len(refs) == len(needed_keys) - len(fallback_keys):
+                        # We still need to finish this shard loop only if more
+                        # keys from this shard remain unresolved.
+                        pass
+        unresolved = keys.difference(refs)
+        if unresolved:
+            preview = ", ".join(sorted(list(unresolved))[:5])
+            raise RuntimeError(f"Missing {len(unresolved)} keys in shard {path}: {preview}")
+
+    if fallback_keys:
+        refs.update(load_reference_by_key(shards, fallback_keys))
+    missing = needed_keys.difference(refs)
+    if missing:
+        preview = ", ".join(sorted(list(missing))[:5])
+        raise RuntimeError(f"Missing {len(missing)} source keys. Examples: {preview}")
     return refs
 
 
@@ -156,7 +242,7 @@ def main():
         raise ValueError("--store_dirs is empty")
     needed_keys = collect_needed_keys(store_dirs, args.samples)
     print(f"[cropdct-fidelity] loading {len(needed_keys)} reference images by source_key", flush=True)
-    refs = load_reference_by_key(args.shards, needed_keys)
+    refs = load_reference_by_key_fast(args.shards, needed_keys)
     rows = []
     for store_dir in store_dirs:
         stats = validate_store(store_dir, refs, args.samples)
