@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import re
 import time
 
@@ -26,6 +27,10 @@ def parse_args():
     p.add_argument("--compression_level", type=int, default=1)
     p.add_argument("--max_longer", type=int, default=0)
     p.add_argument("--max_samples", type=int, default=0)
+    p.add_argument("--random_subset", action="store_true",
+                   help="Shuffle shard order and stream order before taking --max_samples.")
+    p.add_argument("--shuffle_buffer", type=int, default=10000,
+                   help="WebDataset sample shuffle buffer used with --random_subset.")
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
@@ -87,16 +92,18 @@ def build_loader(args):
         raise ValueError(f"No shards expanded from {args.shards!r}")
     if not os.path.exists(urls[0]):
         raise FileNotFoundError(f"First shard does not exist: {urls[0]}")
+    if args.random_subset:
+        rng = random.Random(args.seed)
+        rng.shuffle(urls)
     print(
-        f"[cropdct] shards expanded: count={len(urls)} first={urls[0]} last={urls[-1]}",
+        f"[cropdct] shards expanded: count={len(urls)} first={urls[0]} last={urls[-1]} "
+        f"random_subset={args.random_subset} seed={args.seed}",
         flush=True,
     )
-    dataset = (
-        wds.WebDataset(urls, resampled=False, shardshuffle=False)
-        .decode("pil")
-        .to_tuple("jpg;jpeg;png", "cls")
-        .map_tuple(transform, identity_label)
-    )
+    dataset = wds.WebDataset(urls, resampled=False, shardshuffle=False)
+    if args.random_subset:
+        dataset = dataset.shuffle(args.shuffle_buffer, initial=min(args.shuffle_buffer, 1000))
+    dataset = dataset.decode("pil").to_tuple("jpg;jpeg;png", "cls").map_tuple(transform, identity_label)
     return wds.WebLoader(dataset, batch_size=None, num_workers=0)
 
 

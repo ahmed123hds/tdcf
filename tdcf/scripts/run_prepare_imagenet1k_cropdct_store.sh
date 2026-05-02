@@ -24,6 +24,9 @@ COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-1}"
 RECORDS_PER_SHARD="${RECORDS_PER_SHARD:-1024}"
 DEVICE="${DEVICE:-cpu}"
 MAX_LONGER="${MAX_LONGER:-0}"
+RANDOM_SUBSET="${RANDOM_SUBSET:-0}"
+SHUFFLE_BUFFER="${SHUFFLE_BUFFER:-10000}"
+SEED="${SEED:-42}"
 
 mkdir -p "$OUT_ROOT"
 
@@ -40,6 +43,9 @@ python3 -m tdcf.prepare_cropdct_store \
   --compression_level "$COMPRESSION_LEVEL" \
   --max_longer "$MAX_LONGER" \
   --device "$DEVICE" \
+  --seed "$SEED" \
+  --shuffle_buffer "$SHUFFLE_BUFFER" \
+  $([[ "$RANDOM_SUBSET" == "1" ]] && echo "--random_subset") \
   ${MAX_SAMPLES:+--max_samples "$MAX_SAMPLES"}
 
 echo "[cropdct-prep] Building val store at $OUT_ROOT/val"
@@ -55,6 +61,9 @@ python3 -m tdcf.prepare_cropdct_store \
   --compression_level "$COMPRESSION_LEVEL" \
   --max_longer "$MAX_LONGER" \
   --device "$DEVICE" \
+  --seed "$SEED" \
+  --shuffle_buffer "$SHUFFLE_BUFFER" \
+  $([[ "$RANDOM_SUBSET" == "1" ]] && echo "--random_subset") \
   ${MAX_VAL_SAMPLES:+--max_samples "$MAX_VAL_SAMPLES"}
 
 echo "[cropdct-prep] Done. Store root: $OUT_ROOT"
