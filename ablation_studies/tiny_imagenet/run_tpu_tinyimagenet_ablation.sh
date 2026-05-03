@@ -41,6 +41,7 @@ esac
 
 export PJRT_DEVICE="${PJRT_DEVICE:-TPU}"
 export PYTHONPATH="${PYTHONPATH:-.}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 ROOT="${ROOT:-./results/ablation_studies/tiny_imagenet}"
 DATA_DIR="${DATA_DIR:-./data/tiny_imagenet_block_store}"
@@ -66,7 +67,7 @@ echo "save_dir=${SAVE_DIR}"
 echo "epochs=${EPOCHS} pilot_epochs=${PILOT_EPOCHS} batch_size=${BATCH_SIZE}"
 echo "========================================================================"
 
-python3 -m tdcf.train_tpu_tiny_imagenet \
+python3 -u -m tdcf.train_tpu_tiny_imagenet \
   --data_dir "${DATA_DIR}" \
   --save_dir "${SAVE_DIR}" \
   --total_epochs "${EPOCHS}" \

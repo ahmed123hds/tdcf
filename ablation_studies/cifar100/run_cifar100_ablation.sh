@@ -40,6 +40,7 @@ case "${CAP}" in
 esac
 
 export PYTHONPATH="${PYTHONPATH:-.}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 ROOT="${ROOT:-./results/ablation_studies/cifar100}"
 DATA_DIR="${DATA_DIR:-./data}"
@@ -65,7 +66,7 @@ echo "save_dir=${SAVE_DIR}"
 echo "epochs=${EPOCHS} pilot_epochs=${PILOT_EPOCHS} batch_size=${BATCH_SIZE}"
 echo "========================================================================"
 
-python3 -m tdcf.train_cifar100 \
+python3 -u -m tdcf.train_cifar100 \
   --backbone cnn \
   --total_epochs "${EPOCHS}" \
   --pilot_epochs "${PILOT_EPOCHS}" \
