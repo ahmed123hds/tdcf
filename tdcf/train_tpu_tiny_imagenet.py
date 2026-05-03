@@ -300,6 +300,7 @@ def train_tpu_process(index, args):
     # --- ADAPTIVE TRAINING PHASE ---
     for ep in range(args.total_epochs):
         train_sampler.set_epoch(ep)
+        train_store.reset_epoch_io()
 
         ps_idx = min(ep, len(estimator.patch_sensitivity_history) - 1)
         bs_idx = min(ep, len(estimator.band_sensitivity_history) - 1)
@@ -370,6 +371,22 @@ def train_tpu_process(index, args):
 
         sched_lr.step()
 
+        # Aggregate actual coefficient bytes across TPU workers. This is
+        # the realized physical I/O ratio after the store has served the
+        # epoch, not just the scheduler's target.
+        actual_bytes = xm.mesh_reduce(
+            "train_store_bytes_read_epoch",
+            int(train_store.bytes_read_epoch),
+            sum,
+        )
+        actual_samples = xm.mesh_reduce(
+            "train_store_samples_read_epoch",
+            int(train_store.samples_read_epoch),
+            sum,
+        )
+        actual_full = actual_samples * train_store.bytes_per_sample_full
+        actual_io = actual_bytes / actual_full if actual_full else 0.0
+
         if is_master:
             io_ratio = train_store.get_io_ratio()
             if args.budget_mode:
@@ -377,7 +394,7 @@ def train_tpu_process(index, args):
                 print(
                     f"  E {ep+1:3d}/{args.total_epochs} | "
                     f"Budget={budget:4d}/{P*NUM_BANDS} | "
-                    f"IO={io_ratio:.3f} | "
+                    f"IO={io_ratio:.3f} ActualIO={actual_io:.3f} | "
                     f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
                     f"Te Loss={te_loss_avg:.4f} Te Acc={te_acc:.4f} | "
                     f"LR={opt.param_groups[0]['lr']:.4f}"
@@ -386,7 +403,7 @@ def train_tpu_process(index, args):
                 print(
                     f"  E {ep+1:3d}/{args.total_epochs} | "
                     f"K_hi={K_high:2d} K_lo={args.k_low} q={q_e:2d} | "
-                    f"IO={io_ratio:.3f} | "
+                    f"IO={io_ratio:.3f} ActualIO={actual_io:.3f} | "
                     f"Tr Loss={tr_loss:.4f} Tr Acc={tr_acc:.4f} | "
                     f"Te Loss={te_loss_avg:.4f} Te Acc={te_acc:.4f} | "
                     f"LR={opt.param_groups[0]['lr']:.4f}"

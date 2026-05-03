@@ -94,4 +94,5 @@ PYTHONPATH=.
 
 Run one script per terminal or per TPU allocation. Keep the generated
 `train.log` files with the result folders; they contain the per-epoch budget,
-I/O ratio, and accuracy traces needed for the ablation tables.
+target I/O ratio, realized `ActualIO`, and accuracy traces needed for the
+ablation tables.
