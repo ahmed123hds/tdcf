@@ -91,3 +91,51 @@ equal-size storage is engineering: better variable-length coding and fewer
 random-access overheads. If the lower bound is much larger, then equal-size
 storage at the same PSNR is not realistic without changing the quantization or
 access constraints.
+
+## Native JPEG Coefficient Experiment
+
+The CropDCT store above intentionally re-encodes decoded RGB pixels. The next,
+more storage-faithful experiment stays inside the original JPEG domain:
+
+```text
+original JPEG bytes
+-> parse original quantization tables / subsampling / Huffman scans
+-> decode native quantized DCT coefficients
+-> estimate per-band entropy lower bounds
+-> reconstruct from native coefficients and compare to PIL/libjpeg decode
+```
+
+This tests whether the right long-term path is a native JPEG coefficient store
+rather than a custom RGB-to-DCT re-encoding.
+
+Quick smoke test:
+
+```bash
+SIZE=160px MAX_IMAGES=20 FIDELITY_SAMPLES=5 LOG_EVERY=5 \
+bash experiments/imagenette_cropdct/run_native_jpeg_experiment.sh
+```
+
+Main 1000-image full-size test:
+
+```bash
+MAX_IMAGES=1000 FIDELITY_SAMPLES=50 LOG_EVERY=100 \
+bash experiments/imagenette_cropdct/run_native_jpeg_experiment.sh
+```
+
+Full train split:
+
+```bash
+MAX_IMAGES=0 FIDELITY_SAMPLES=100 LOG_EVERY=250 \
+bash experiments/imagenette_cropdct/run_native_jpeg_experiment.sh
+```
+
+Important: this first native JPEG implementation supports baseline sequential
+JPEGs. It reports unsupported files separately. Imagenette samples tested so far
+were baseline 4:2:0 JPEGs, which is exactly the common ImageNet-style case.
+
+The key numbers are:
+
+- `native_entropy_lb/original`: theoretical coefficient entropy versus original JPEG bytes.
+- `entropy+headers/original`: coefficient entropy plus original JPEG header bytes.
+- `raw_int16/original`: how bad raw coefficient storage would be.
+- `reconstruct_vs_pil`: sanity check that native coefficients reconstruct close to PIL decode.
