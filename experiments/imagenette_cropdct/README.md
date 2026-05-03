@@ -139,3 +139,39 @@ The key numbers are:
 - `entropy+headers/original`: coefficient entropy plus original JPEG header bytes.
 - `raw_int16/original`: how bad raw coefficient storage would be.
 - `reconstruct_vs_pil`: sanity check that native coefficients reconstruct close to PIL decode.
+
+## Native JPEG On ImageNet-1K WebDataset
+
+Once the Imagenette result looks promising, run the same native JPEG analysis on
+ImageNet-1K WebDataset shards. This does not build a training store yet; it
+measures the storage/fidelity limit of using original JPEG coefficients.
+
+Quick 1000-sample train probe:
+
+```bash
+MAX_IMAGES=1000 FIDELITY_SAMPLES=50 LOG_EVERY=100 \
+bash experiments/imagenette_cropdct/run_native_jpeg_imagenet1k.sh
+```
+
+10k train probe:
+
+```bash
+MAX_IMAGES=10000 FIDELITY_SAMPLES=100 LOG_EVERY=1000 \
+bash experiments/imagenette_cropdct/run_native_jpeg_imagenet1k.sh
+```
+
+Validation split:
+
+```bash
+SPLIT=val MAX_IMAGES=5000 FIDELITY_SAMPLES=100 LOG_EVERY=500 \
+bash experiments/imagenette_cropdct/run_native_jpeg_imagenet1k.sh
+```
+
+Override shard paths if needed:
+
+```bash
+TRAIN_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-train-{0000..1023}.tar' \
+VAL_SHARDS='/mnt/dataset_disk/imagenet_hf/imagenet1k-validation-{00..63}.tar' \
+MAX_IMAGES=10000 \
+bash experiments/imagenette_cropdct/run_native_jpeg_imagenet1k.sh
+```

@@ -1,4 +1,4 @@
-"""Native JPEG coefficient experiment for Imagenette.
+"""Native JPEG coefficient experiment for Imagenette or ImageNet WebDataset.
 
 This is a research harness, not a production training dataloader. It answers a
 specific question:
@@ -15,13 +15,17 @@ sanity check against PIL/libjpeg decoding.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
+import re
+import tarfile
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -169,10 +173,9 @@ def be16(data: bytes, pos: int) -> int:
     return (data[pos] << 8) | data[pos + 1]
 
 
-def parse_jpeg(path: str) -> NativeJPEG:
-    data = Path(path).read_bytes()
+def parse_jpeg_bytes(data: bytes, source: str = "<bytes>") -> NativeJPEG:
     if len(data) < 4 or data[0:2] != b"\xff\xd8":
-        raise ValueError(f"{path} is not a JPEG file")
+        raise ValueError(f"{source} is not a JPEG file")
 
     quant_tables: Dict[int, np.ndarray] = {}
     huff_tables: Dict[Tuple[int, int], HuffmanTable] = {}
@@ -186,7 +189,7 @@ def parse_jpeg(path: str) -> NativeJPEG:
     pos = 2
     while pos < len(data):
         if data[pos] != 0xFF:
-            raise ValueError(f"Expected JPEG marker at byte {pos} in {path}")
+            raise ValueError(f"Expected JPEG marker at byte {pos} in {source}")
         while pos < len(data) and data[pos] == 0xFF:
             pos += 1
         if pos >= len(data):
@@ -198,7 +201,7 @@ def parse_jpeg(path: str) -> NativeJPEG:
         if marker in STANDALONE_MARKERS:
             continue
         if pos + 2 > len(data):
-            raise ValueError(f"Truncated marker segment in {path}")
+            raise ValueError(f"Truncated marker segment in {source}")
         seg_len = be16(data, pos)
         pos += 2
         payload = data[pos:pos + seg_len - 2]
@@ -218,7 +221,7 @@ def parse_jpeg(path: str) -> NativeJPEG:
                     vals = np.array([be16(payload, p + 2 * i) for i in range(64)], dtype=np.int32)
                     p += 128
                 else:
-                    raise ValueError(f"Invalid DQT precision {precision_bits} in {path}")
+                    raise ValueError(f"Invalid DQT precision {precision_bits} in {source}")
                 quant_tables[table_id] = vals
         elif marker in (SOF_BASELINE, SOF_PROGRESSIVE):
             sof_marker = marker
@@ -289,7 +292,7 @@ def parse_jpeg(path: str) -> NativeJPEG:
             pos = j
 
     return NativeJPEG(
-        path=path,
+        path=source,
         width=width,
         height=height,
         precision=precision,
@@ -302,6 +305,10 @@ def parse_jpeg(path: str) -> NativeJPEG:
         header_bytes=max(0, len(data) - entropy_bytes),
         entropy_bytes=entropy_bytes,
     )
+
+
+def parse_jpeg(path: str) -> NativeJPEG:
+    return parse_jpeg_bytes(Path(path).read_bytes(), source=path)
 
 
 def receive_extend(reader: EntropyBitReader, size: int) -> int:
@@ -438,6 +445,11 @@ def read_pil_tensor(path: str) -> torch.Tensor:
         return T.ToTensor()(img.convert("RGB"))
 
 
+def read_pil_tensor_from_bytes(data: bytes) -> torch.Tensor:
+    with Image.open(io.BytesIO(data)) as img:
+        return T.ToTensor()(img.convert("RGB"))
+
+
 def entropy_bits(counts: Counter) -> float:
     total = sum(counts.values())
     if total <= 0:
@@ -460,6 +472,64 @@ def image_paths(data_root: str, size: str, split: str, max_images: int) -> List[
     return paths
 
 
+def expand_braces(pattern: str) -> List[str]:
+    paths: List[str] = []
+    for item in (x.strip() for x in pattern.split(",")):
+        if not item:
+            continue
+        m = re.search(r"\{(\d+)\.\.(\d+)\}", item)
+        if m is None:
+            paths.append(item)
+            continue
+        start_s, end_s = m.group(1), m.group(2)
+        width = max(len(start_s), len(end_s))
+        start, end = int(start_s), int(end_s)
+        if end < start:
+            raise ValueError(f"Invalid shard range in {item!r}")
+        for i in range(start, end + 1):
+            paths.append(item[:m.start()] + f"{i:0{width}d}" + item[m.end():])
+    return paths
+
+
+def iter_webdataset_jpegs(shards: str, max_images: int) -> Iterator[Tuple[str, bytes, int]]:
+    paths = expand_braces(shards)
+    if not paths:
+        raise ValueError(f"No shards expanded from {shards!r}")
+    if not os.path.exists(paths[0]):
+        raise FileNotFoundError(f"First shard does not exist: {paths[0]}")
+
+    count = 0
+    image_exts = {"jpg", "jpeg"}
+    for shard_path in paths:
+        pending: Dict[str, Dict[str, object]] = {}
+        with tarfile.open(shard_path, "r:*") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                name = member.name[2:] if member.name.startswith("./") else member.name
+                if "." not in name:
+                    continue
+                key, ext = name.rsplit(".", 1)
+                ext = ext.lower()
+                if ext not in image_exts and ext != "cls":
+                    continue
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                rec = pending.setdefault(key, {})
+                if ext in image_exts:
+                    rec["image"] = f.read()
+                elif ext == "cls":
+                    rec["label"] = int(f.read().decode("utf-8").strip())
+                if "image" in rec and "label" in rec:
+                    source = f"{os.path.basename(shard_path)}:{key}"
+                    yield source, rec["image"], int(rec["label"])
+                    count += 1
+                    del pending[key]
+                    if max_images > 0 and count >= max_images:
+                        return
+
+
 def subsampling_key(jpeg: NativeJPEG) -> str:
     if len(jpeg.components) == 1:
         return "grayscale"
@@ -473,7 +543,7 @@ def subsampling_key(jpeg: NativeJPEG) -> str:
     return ",".join(f"{h}x{v}" for h, v in hv)
 
 
-def analyze(paths: List[str], args: argparse.Namespace) -> Dict[str, object]:
+def analyze_samples(samples: Iterable[Tuple[str, bytes, Optional[str]]], args: argparse.Namespace) -> Dict[str, object]:
     band_counts = [Counter() for _ in DEFAULT_BANDS]
     band_symbols = [0 for _ in DEFAULT_BANDS]
     component_symbols = 0
@@ -488,10 +558,12 @@ def analyze(paths: List[str], args: argparse.Namespace) -> Dict[str, object]:
     max_diffs: List[float] = []
     examples = []
 
-    for idx, path in enumerate(paths):
-        original_bytes += os.path.getsize(path)
+    files = 0
+    for idx, (source, jpeg_bytes, path_for_pil) in enumerate(samples):
+        files += 1
+        original_bytes += len(jpeg_bytes)
         try:
-            jpeg = parse_jpeg(path)
+            jpeg = parse_jpeg_bytes(jpeg_bytes, source=source)
             coeffs = decode_baseline_coefficients(jpeg)
         except Exception as exc:
             unsupported[type(exc).__name__ + ":" + str(exc).split("\n", 1)[0][:80]] += 1
@@ -513,7 +585,7 @@ def analyze(paths: List[str], args: argparse.Namespace) -> Dict[str, object]:
 
         if len(psnrs) < args.fidelity_samples:
             recon = reconstruct_rgb(jpeg, coeffs).squeeze(0).cpu()
-            ref = read_pil_tensor(path)
+            ref = read_pil_tensor(path_for_pil) if path_for_pil else read_pil_tensor_from_bytes(jpeg_bytes)
             if tuple(recon.shape) == tuple(ref.shape):
                 diff = (recon - ref).abs()
                 psnrs.append(psnr(recon, ref))
@@ -522,18 +594,18 @@ def analyze(paths: List[str], args: argparse.Namespace) -> Dict[str, object]:
                 if len(examples) < 5:
                     examples.append(
                         {
-                            "path": path,
+                            "source": source,
                             "psnr": psnrs[-1],
                             "mae": maes[-1],
                             "max_diff": max_diffs[-1],
                             "subsampling": subsampling_key(jpeg),
-                            "bytes": os.path.getsize(path),
+                            "bytes": len(jpeg_bytes),
                         }
                     )
 
-        if (idx + 1) % args.log_every == 0 or idx + 1 == len(paths):
+        if args.log_every > 0 and (idx + 1) % args.log_every == 0:
             print(
-                f"[native-jpeg] scanned {idx + 1}/{len(paths)} files | "
+                f"[native-jpeg] scanned {idx + 1} files | "
                 f"supported={supported} unsupported={sum(unsupported.values())}",
                 flush=True,
             )
@@ -568,7 +640,7 @@ def analyze(paths: List[str], args: argparse.Namespace) -> Dict[str, object]:
     }
     native_entropy_plus_headers = entropy_lb_total + header_bytes
     return {
-        "files": len(paths),
+        "files": files,
         "supported_baseline_files": supported,
         "unsupported_files": int(sum(unsupported.values())),
         "unsupported_reasons": dict(unsupported),
@@ -590,9 +662,19 @@ def analyze(paths: List[str], args: argparse.Namespace) -> Dict[str, object]:
     }
 
 
+def analyze(paths: List[str], args: argparse.Namespace) -> Dict[str, object]:
+    def samples() -> Iterator[Tuple[str, bytes, Optional[str]]]:
+        for path in paths:
+            yield path, Path(path).read_bytes(), path
+
+    return analyze_samples(samples(), args)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Native JPEG coefficient storage experiment")
+    p.add_argument("--source", choices=["imagenette", "webdataset"], default="imagenette")
     p.add_argument("--data_root", type=str, default="experiments/imagenette_cropdct/work/data")
+    p.add_argument("--shards", type=str, default="")
     p.add_argument("--out_dir", type=str, default="experiments/imagenette_cropdct/work/native_jpeg")
     p.add_argument("--size", choices=["full", "320px", "160px"], default="full")
     p.add_argument("--split", choices=["train", "val"], default="train")
@@ -606,17 +688,34 @@ def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = image_paths(args.data_root, args.size, args.split, args.max_images)
+    paths: List[str] = []
     print("=" * 72)
     print("Native JPEG coefficient experiment")
-    print(f"size={args.size} split={args.split} files={len(paths)}")
-    print(f"data_root={args.data_root}")
+    print(f"source={args.source} size={args.size} split={args.split} max_images={args.max_images}")
+    if args.source == "imagenette":
+        paths = image_paths(args.data_root, args.size, args.split, args.max_images)
+        print(f"files={len(paths)} data_root={args.data_root}")
+    else:
+        if not args.shards:
+            raise ValueError("--shards is required with --source webdataset")
+        expanded = expand_braces(args.shards)
+        print(f"shards={len(expanded)} first={expanded[0]} last={expanded[-1]}")
     print("=" * 72)
+    if args.source == "imagenette":
+        result = analyze(paths, args)
+        sample_count = len(paths)
+    else:
+        result = analyze_samples(
+            ((source, data, None) for source, data, _label in iter_webdataset_jpegs(args.shards, args.max_images)),
+            args,
+        )
+        sample_count = int(result["files"])
     report = {
         "args": vars(args),
-        "report": analyze(paths, args),
+        "report": result,
     }
-    report_path = out_dir / f"native_jpeg_{args.size}_{args.split}_{len(paths)}.json"
+    name = "imagenette" if args.source == "imagenette" else "webdataset"
+    report_path = out_dir / f"native_jpeg_{name}_{args.size}_{args.split}_{sample_count}.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
 
@@ -655,4 +754,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
